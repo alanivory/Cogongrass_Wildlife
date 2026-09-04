@@ -1,0 +1,1822 @@
+---
+title: "Non-Spatial Occupancy Model"
+author: "Alan Ivory"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Set-up
+Install necessary packages and import appropriate data
+
+```{r setup_All}
+knitr::opts_chunk$set(echo = TRUE)
+
+pacman::p_load(tidyverse, readxl, raster, vegan, tigris,
+               sf, sjPlot, sp, spOccupancy, ggrepel,
+               lme4, lmerTest, MuMIn, brms, MCMCvis,
+               bayesplot, patchwork, kableExtra,
+               flextable, officer)
+
+set.seed(97)
+
+# Tree PCQ Data
+tree_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Tree_PCQ")
+
+# CWD Data
+cwd_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                       sheet = "CWD")
+
+# Soil Data
+fuel_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Fuel_Sampling")
+
+# Veg Data
+Veg_Cover <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Veg_Cover")
+
+# Shrub Cover Data
+shrub_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                         sheet = "Shrub_Cover")
+
+# Site Data
+CameraData <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/04_Wildlife/02_Data/CameraData.xlsx")
+
+CameraLoc <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/04_Wildlife/02_Data/CameraLoc.xlsx",
+                  sheet = "CameraLocations")
+
+# Add effort data
+effort_matrix <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/04_Wildlife/02_Data/CameraLoc.xlsx",
+                            sheet = "Effort_Matrix_Full") %>%
+  pivot_longer(cols = matches("^202[4-5]-"), names_to = "week", values_to = "days") %>%
+  filter(days == "7") %>%
+  dplyr::select(Plot, week)
+```
+
+
+## Coordinate Transformation
+```{r Coord_Transform_All}
+
+coords_sf <- CameraLoc %>%
+  dplyr::select(Plot, Long, Lat) %>%
+  st_as_sf(coords = c("Long", "Lat"), crs = 4326) %>%
+  st_transform(crs = 32616)  # UTM zone 16N
+
+coords <- st_coordinates(coords_sf)
+rownames(coords) <- CameraLoc$Plot
+```
+
+## Number of quadrats sampled per plot
+```{r Quadrats_All}
+# Count the total number of quadrats per plot
+quadrat_count <- Veg_Cover %>%
+  group_by(Plot) %>%
+  summarize(total_quadrats = n_distinct(Quadrat), .groups = "drop")
+```
+
+## Filter All data to only include specified species (Per PLANTS database)
+```{r Filter_All}
+#Filter tree data to only include trees with "tree" in the growth column
+tree_data <- dplyr::filter(tree_data, Growth == "Tree")
+
+#Filter Veg Cover to exclude Shrubs and Trees
+Veg_Cover <- dplyr::filter(Veg_Cover, Growth != "Shrub" & Growth != "Tree")
+
+#Filter Shrub Cover to only include Shrubs and Trees
+shrub_data <- dplyr::filter(shrub_data, Growth == "Shrub" | Growth == "Tree")
+
+```
+
+## Provides the option to rarify vegetative species
+```{r RareFilter_All}
+# Calculate the total number of sites
+total_sites <- nrow(CameraLoc)
+
+# Function to filter data by frequency
+filter_by_frequency <- function(df) {
+  # Group data by species and calculate the frequency
+  freq <- df %>%
+    group_by(Species) %>%
+    summarise(Frequency = n_distinct(Plot) / nrow(CameraLoc) * 100) %>%
+    filter(Frequency >= 0)
+  
+  # Filter the original data to include only species with frequency >= XX%
+  filtered_df <- df %>%
+    filter(Species %in% freq$Species)
+  
+  return(filtered_df)
+}
+
+# Filter tree data by frequency
+tree_data <- filter_by_frequency(tree_data)
+
+# Filter Veg Cover data by frequency
+Veg_Cover <- filter_by_frequency(Veg_Cover)
+
+# Filter Shrub Cover data by frequency
+shrub_data <- filter_by_frequency(shrub_data)
+
+```
+
+
+
+## Shrub Cover Conversion
+```{r Shrub_Cover_All}
+# Total length of Shrub cover at a site
+shrub_cover <- shrub_data %>%
+  mutate(Cover = Line_End - Line_Start) %>%
+  group_by(Species_Name, Plot) %>%
+  summarise(Shrub_Total_Cover = sum(Cover, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Shrub_Percent_Cover = Shrub_Total_Cover / 3000 * 100)
+
+# Summed length of shrub over at a site
+shrub_cover_summed <- shrub_cover %>%
+  group_by(Plot) %>%
+  summarize(total_shrub_cover = sum(Shrub_Total_Cover, na.rm = TRUE), .groups = "drop")
+
+```
+
+## Herbacous Cover Conversion
+```{r Cogon_Site_All}
+# Combine Plot and Quadrat columns
+Veg_Cover <- Veg_Cover %>%
+  mutate(Plot_Quadrat = paste(Plot, Quadrat, sep = '_'))
+
+# Join with CogonSites to get site information
+Veg_Cover <- Veg_Cover %>%
+  left_join(CameraLoc, by = "Plot")
+
+# Sum species cover across quadrats for each species at each plot
+veg_cover_summed <- Veg_Cover %>%
+  group_by(Plot, Species_Name) %>%
+  summarize(total_cover = sum(Cover_Per, na.rm = TRUE), .groups = "drop")
+
+# Calculate average herbaceous species cover
+avg_species_cover <- veg_cover_summed %>%
+  left_join(quadrat_count, by = "Plot") %>%
+  mutate(avg_cover = total_cover / total_quadrats)
+
+```
+
+## Merging Herb cover with Shrub
+
+This species matrix includes herbaceous and shrub species
+```{r Herb_Shrub_All}
+# Merge shrub cover with herbaceous average cover
+combined_cover <- avg_species_cover %>%
+  full_join(
+    shrub_cover %>%
+      dplyr::select(Plot, Species_Name, Shrub_Percent_Cover),
+    by = c("Plot", "Species_Name")
+  ) %>%
+  mutate(
+    overlap_flag = ifelse(!is.na(avg_cover) & !is.na(Shrub_Percent_Cover), TRUE, FALSE), # Flag overlaps
+    final_cover = case_when(
+      !is.na(avg_cover) & is.na(Shrub_Percent_Cover) ~ avg_cover,  # Use herbaceous cover if no shrub data
+      is.na(avg_cover) & !is.na(Shrub_Percent_Cover) ~ Shrub_Percent_Cover, # Use shrub cover if no herbaceous data
+      TRUE ~ NA_real_ # NA where overlaps exist
+    )
+  )
+
+# Species Matrix
+species_matrix <- combined_cover %>%
+  dplyr::select(Plot, Species_Name, final_cover) %>%
+  pivot_wider(
+    names_from = Species_Name,
+    values_from = final_cover,
+    values_fill = 0
+  )
+```
+
+## Summarize Cogongrass Cover
+```{r Cogon_Cover_All}
+avg_cogongrass_cover <- species_matrix %>%
+  group_by(Plot) %>%
+  summarize(Avg_Cogongrass_Cover = sum(Imperata_cylindrica, na.rm = TRUE) / n(), .groups = "drop")
+
+```
+
+## Herbacous Shannon Diversity Index
+```{r Shannon_Diversity}
+# Summarize species cover by site
+site_species_cover <- Veg_Cover %>%
+  group_by(Plot, Species_Name) %>%
+  summarize(total_cover = sum(Cover_Per, na.rm = TRUE)) %>%
+  ungroup()
+
+## Remove all Imperata_cylindrica_Live and Imperata_cylindrica from species
+site_species_cover <- site_species_cover %>%
+  filter(Species_Name != "Imperata_cylindrica_Live" & Species_Name != "Imperata_cylindrica")
+
+# Calculate Shannon diversity per site
+Veg_shannon_diversity <- site_species_cover %>%
+  group_by(Plot) %>%
+  mutate(proportion = total_cover / sum(total_cover)) %>%
+  summarize(Veg_shannon_index = -sum(proportion * log(proportion), na.rm = TRUE))
+
+print(Veg_shannon_diversity)
+```
+
+## Vegetation Height
+```{r Veg_Height_All}
+if (!is.numeric(fuel_data$Height)) {
+  fuel_data$Height <- as.numeric(as.character(fuel_data$Height))
+}
+
+# Calculate average vegetation height per plot
+veg_height <- fuel_data %>%
+  group_by(Plot) %>%
+  summarize(avg_veg_height = mean(Height, na.rm = TRUE), .groups = "drop")
+```
+
+## Tree Metrics
+```{r Tree_Metrics_All}
+# Tree density from point-centered quarter data
+if (!is.numeric(tree_data$Distance)) {
+  tree_data$Distance <- as.numeric(as.character(tree_data$Distance))
+}
+
+tree_density_data <- tree_data %>%
+  group_by(Plot) %>%
+  summarize(Average_Distance = mean(Distance) / 100,  # Convert to meters
+            Tree_Density = 10000 / (Average_Distance^2))  # Convert to trees per hectare
+
+# Average canopy cover from vegetation quadrats
+tree_canopy_data <- Veg_Cover %>%
+  distinct(Plot, Quadrat, .keep_all = TRUE) %>%  # Ensure each quadrat counts once per plot
+  group_by(Plot) %>%
+  summarize(Avg_Canopy_Cover = mean(Canopy_Cover, na.rm = TRUE), .groups = "drop") # Calculate the average canopy cover per plot
+
+cor(tree_density_data$Tree_Density, tree_canopy_data$Avg_Canopy_Cover)
+
+
+```
+
+## CWD Clean
+```{r CWD_Clean_All}
+cwd_pa <- cwd_data %>%
+  group_by(Plot) %>%
+  summarise(
+    CWD_presence = as.integer(any(Line_Start > 0 & Line_End > 0)),
+    .groups = "drop"
+  )
+```
+
+# Objective 1: Assessing if cogongrass invasion-related factors influence wildlife presence
+
+## Add Covariates
+```{r Cov_Dat}
+CameraLoc <- CameraLoc %>%
+  left_join(cwd_pa, by = "Plot") %>%
+  left_join(Veg_shannon_diversity, by = "Plot") %>%
+  left_join(avg_cogongrass_cover, by = "Plot") %>%
+  left_join(shrub_cover_summed %>% dplyr::select(Plot, total_shrub_cover), by = "Plot") %>%
+  left_join(veg_height, by = "Plot") %>%
+  left_join(tree_density_data %>% dplyr::select(Plot, Tree_Density), by = "Plot") %>%
+  left_join(tree_canopy_data %>% dplyr::select(Plot, Avg_Canopy_Cover), by = "Plot") %>%
+  dplyr::select(-Authority)
+```
+
+## Distribution of Covariates
+```{r Cov_Distribution}
+par(mfrow = c(3, 3))
+hist(CameraLoc$Cogon_Patch_Size, main = "Cogon Patch Size", xlab = "Size (m²)")
+hist(CameraLoc$Veg_shannon_index, main = "Vegetation Shannon Index", xlab = "Shannon Index")
+hist(CameraLoc$total_shrub_cover, main = "Total Shrub Cover", xlab = "Shrub Cover (%)")
+hist(CameraLoc$Avg_Cogongrass_Cover, main = "Average Cogongrass Cover", xlab = "Cogongrass Cover (%)")
+  
+hist(CameraLoc$Tree_Density, main = "Tree Density", xlab = "Trees per ha")
+hist(CameraLoc$Avg_Canopy_Cover, main = "Average Canopy Cover", xlab = "Canopy Cover (%)")
+hist(CameraLoc$avg_veg_height, main = "Average Vegetation Height", xlab = "Height (cm)")
+table(CameraLoc$CWD_presence)
+par(mfrow = c(1, 1))
+```
+
+## Subset to mammals with >10 observations
+```{r Sub_Species}
+exclude_species <- c(
+  "Odocoileus_virginianus",
+  "Dasypus_novemcinctus"
+)
+
+species_counts <- CameraData %>%
+  filter(
+    (Class == "Mammalia" & !Name %in% exclude_species) |
+    Name == "Meleagris_gallopavo"
+  ) %>%
+  group_by(Name) %>%
+  summarize(count = n(), .groups = "drop")
+
+# Filter for species with count greater than 10
+species_subset <- species_counts %>%
+  filter(count > 10) %>%
+  pull(Name)
+
+# Filter CameraData to only include species with count > 10
+CameraData <- CameraData %>%
+  filter(Name %in% species_subset)
+```
+
+## Create Detection Matrix
+```{r DetMat}
+# Format Data Weekly
+observations_weekly <- CameraData %>%
+  group_by(Plot, week = format(as.Date(Date), "%Y-%U"), Name) %>%
+  summarise(observations = n(), .groups = 'drop')
+
+# Merge with Effort Matrix to include only valid weeks
+observations_weekly <- effort_matrix %>%
+  left_join(observations_weekly, by = c("Plot" = "Plot", "week")) %>%
+  replace_na(list(observations = 0))
+
+# Convert to wide format
+observations_species <- observations_weekly %>%
+  pivot_wider(names_from = Name, values_from = observations, values_fill = list(observations = 0)) %>%
+  dplyr::select(-"NA")
+
+# Create detection array
+site_names <- sort(unique(observations_species$Plot))
+species_names <- setdiff(colnames(observations_species), c("Plot", "week"))
+
+num_sites <- length(site_names)
+num_weeks <- length(unique(observations_species$week))
+num_species <- length(species_names)
+
+detection_array <- array(0, dim = c(num_sites, num_weeks, num_species))
+dimnames(detection_array) <- list(site_names, unique(observations_species$week), species_names)
+
+for (s in seq_along(species_names)) {
+  species_col <- species_names[s]
+  for (i in seq_along(site_names)) {
+    site <- site_names[i]
+    for (j in seq_along(unique(observations_species$week))) {
+      week <- unique(observations_species$week)[j]
+      detection_array[i, j, s] <- ifelse(
+        any(observations_species$Plot == site & observations_species$week == week & observations_species[[species_col]] > 0),
+        1, 0
+      )
+    }
+  }
+}
+
+dim(detection_array) # Should be num_sites x num_weeks x num_species
+
+```
+
+## Prepare Site Covariates
+```{r SiteCov}
+# Duplicate CameraLoc to be used in Objective 2
+CameraLoc_O2 <- CameraLoc
+
+# Standardize the covariates
+CameraLoc <- CameraLoc %>%
+  dplyr::select(-Plot, -Camera, -Lat, -Long, -Status, - Start_Date)
+covariates_matrix <- as.matrix(CameraLoc)
+rownames(covariates_matrix) <- site_names
+
+# Standardizing covariates
+covariates_matrix <- scale(covariates_matrix)
+
+## Correlation
+cor_mat <- cor(covariates_matrix)
+
+# Create week matrix for covariate structure [site x week]
+week_vals <- unique(observations_species$week)
+week_matrix <- matrix(rep(week_vals, each = num_sites), nrow = num_sites, ncol = num_weeks, byrow = FALSE)
+
+# Create detection covariate list
+det.covs <- list(
+  shrub_cover = covariates_matrix[, "total_shrub_cover"],
+  veg_height = covariates_matrix[, "avg_veg_height"],
+  week = week_matrix
+)
+
+# Remove dash and convert to numeric
+week_numeric <- as.numeric(gsub("-", "", det.covs$week))
+
+## Scale and center week_numeric
+week_numeric <- scale(week_numeric)
+
+# Reshape into the original 32x36 matrix
+det.covs$week <- matrix(week_numeric, nrow = 32, ncol = 36)
+
+det.covs$Auth <- matrix(CameraLoc$Auth, nrow = 32, ncol = 36)
+str(det.covs)
+
+```
+
+## Combine data into a list
+This requires combining the presence data and the site covariate data into a single list. This also means that the presence data is in a 3-d format.
+```{r Combine_List_Data}
+# Combine into a named list
+data_list <- list(
+  y = detection_array,
+  occ.covs = covariates_matrix,
+  det.covs = det.covs
+  #,
+  #coords = coords
+)
+
+str(data_list)
+```
+
+## Convert occupancy and detection covariates to a dataframe (from matrix)
+
+```{r Convert_DF}
+# Convert occupancy and detection covariates to a dataframe
+data_list[["occ.covs"]] <- as.data.frame(data_list[["occ.covs"]])
+data_list[["occ.covs"]]$total_shrub_cover <- as.numeric(data_list[["occ.covs"]]$total_shrub_cover)
+
+#data_list[["det.covs"]] <- as.data.frame(data_list[["det.covs"]])
+#data_list[["det.covs"]]$total_shrub_cover <- as.numeric(data_list[["det.covs"]]$total_shrub_cover)
+
+# Make species the first dimension
+data_list$y <- aperm(data_list$y, c(3, 1, 2))
+
+dimnames(data_list$y) <- list(species = dimnames(data_list$y)[[1]],
+                              site = dimnames(data_list$y)[[2]],
+                              week = dimnames(data_list$y)[[3]])
+
+str(data_list)
+```
+
+## Site Covariates
+```{r Site_Covariates}
+# Define detection formulas
+det.null <- ~ 1
+det.full <- ~ shrub_cover + veg_height + week + (1 | Auth)
+det.cover <- ~ shrub_cover + veg_height + (1 | Auth)
+det.week <- ~ week + (1 | Auth)
+det.week.quad <- ~ week + I(week^2) + (1 | Auth)
+det.full.quad <- ~ shrub_cover + veg_height + week + I(week^2) + (1 | Auth)
+
+
+# Define occupancy formulas
+occ.null <- ~ 1
+
+occ.full <- ~ #Cogon_Patch_Size + 
+  Veg_shannon_index + total_shrub_cover +
+  Avg_Cogongrass_Cover + 
+  #Tree_Density + 
+  Avg_Canopy_Cover +
+  avg_veg_height + CWD_presence + (1 | Auth)
+
+occ.full.quad <- ~ #Cogon_Patch_Size + 
+  Veg_shannon_index + total_shrub_cover +
+  Avg_Cogongrass_Cover + I(Avg_Cogongrass_Cover^2) +
+  #Tree_Density + 
+  Avg_Canopy_Cover +
+  avg_veg_height + CWD_presence + (1 | Auth)
+
+occ.cover <- ~ Avg_Cogongrass_Cover + total_shrub_cover +
+  avg_veg_height + CWD_presence + (1 | Auth)
+
+occ.canopy <- ~ #Tree_Density + 
+  Avg_Canopy_Cover + Avg_Cogongrass_Cover + (1 | Auth)
+
+occ.canopy.quad <- ~ #Tree_Density + 
+  Avg_Canopy_Cover + Avg_Cogongrass_Cover + I(Avg_Cogongrass_Cover^2) + (1 | Auth)
+
+occ.move <- ~ #Cogon_Patch_Size + 
+  Avg_Cogongrass_Cover + total_shrub_cover + (1 | Auth)
+
+occ.move.quad <- ~ #Cogon_Patch_Size + 
+  Avg_Cogongrass_Cover + I(Avg_Cogongrass_Cover^2) +
+  total_shrub_cover + (1 | Auth)
+
+occ.forage <- ~ Veg_shannon_index + Avg_Cogongrass_Cover + (1 | Auth)
+
+occ.forage.quad <- ~ Veg_shannon_index + Avg_Cogongrass_Cover +
+  I(Avg_Cogongrass_Cover^2) + (1 | Auth)
+
+occ.cogon <- ~ Avg_Cogongrass_Cover + (1 | Auth)
+
+occ.cogon.quad <- ~ Avg_Cogongrass_Cover + I(Avg_Cogongrass_Cover^2) + (1 | Auth)
+```
+
+## Priors
+```{r Priors}
+priors <- list(
+  # Community-level effects
+  beta.comm.normal  = list(mean = 0, var = 2.73),
+  alpha.comm.normal = list(mean = 0, var = 2.73),
+
+  # Species-level variance (hierarchical shrinkage)
+  tau.sq.beta.ig  = list(2, 1),
+  tau.sq.alpha.ig = list(2, 1)#,
+
+  # Spatial variance
+  #sigma.sq.ig = list(3, 2),
+
+  # Spatial decay
+  #phi.unif = list(0.05, 3) # 0.05 (5km) local & 3 (300 km) large-scale
+)
+
+```
+
+## Run the occupancy model
+```{r OccupancyModel, include=FALSE}
+ms_null_null <- msPGOcc(
+  occ.formula = occ.null,
+  det.formula = det.null,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+
+summary(ms_null_null)
+
+# Includes all covariates of detection and occupancy
+ms_full_full <- msPGOcc(
+  occ.formula = occ.full,
+  det.formula = det.full,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+
+summary(ms_full_full)
+
+
+#Includes cover for detection and only foraging for occupancy
+ms_cover_forage <- msPGOcc(
+  occ.formula = occ.forage,
+  det.formula = det.cover,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_cover_forage)
+
+# Includes movement covariates of occupancy and cover for detection
+ms_cover_move <- msPGOcc(
+  occ.formula = occ.move,
+  det.formula = det.cover,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_cover_move)
+
+#Includes cover covariate of detection and only canopy for occupancy
+ms_cover_canopy <- msPGOcc(
+  occ.formula = occ.canopy,
+  det.formula = det.cover,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_cover_canopy)
+
+
+#Includes cover covariate of detection and only quadratic canopy for occupancy
+ms_cover_canopyQ <- msPGOcc(
+  occ.formula = occ.canopy.quad,
+  det.formula = det.cover,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_cover_canopyQ)
+
+
+
+# Includes quadratic week covariate of detection and quadratic cogon for occupancy
+ms_weekQ_cogonQ<- msPGOcc(
+  occ.formula = occ.cogon.quad,
+  det.formula = det.week.quad,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_weekQ_cogonQ)
+
+# Includes quadratic week and full covariates of detection and all covariates and coverage for occupancy
+ms_fullQ_cover<- msPGOcc(
+  occ.formula = occ.cover,
+  det.formula = det.full.quad,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_fullQ_cover)
+
+
+#Includes quadratic week and full covariates of detection and only foraging for occupancy
+ms_fullQ_forage<- msPGOcc(
+  occ.formula = occ.forage,
+  det.formula = det.full.quad,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_fullQ_forage)
+
+
+
+#Includes quadratic week and full covariates of detection and quadratic of move for occupancy
+ms_fullQ_moveQ<- msPGOcc(
+  occ.formula = occ.move.quad,
+  det.formula = det.full.quad,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_fullQ_moveQ)
+
+
+# Includes quadratic week and full covariates of detection and all covariates and quadratic cogon for occupancy
+ms_fullQ_fullQ<- msPGOcc(
+  occ.formula = occ.full.quad,
+  det.formula = det.full.quad,
+  data = data_list,
+  priors = priors,
+  n.samples = 10000,
+  n.burn = 3000,
+  n.thin = 2,
+  n.chains = 4,
+  n.report = 1000
+)
+
+summary(ms_fullQ_fullQ)
+```
+
+## Model Comparison
+```{r Model_Comparison}
+waicOcc(ms_full_full, by.sp = FALSE)
+waicOcc(ms_null_null, by.sp = FALSE)
+waicOcc(ms_cover_forage, by.sp = FALSE)
+waicOcc(ms_cover_move, by.sp = FALSE)
+waicOcc(ms_cover_canopy, by.sp = FALSE)
+waicOcc(ms_cover_canopyQ, by.sp = FALSE)
+waicOcc(ms_weekQ_cogonQ, by.sp = FALSE)
+waicOcc(ms_fullQ_moveQ, by.sp = FALSE)
+waicOcc(ms_fullQ_cover, by.sp = FALSE)
+waicOcc(ms_fullQ_forage, by.sp = FALSE)
+waicOcc(ms_fullQ_fullQ, by.sp = FALSE)
+```
+
+## Model Validation
+This test explains how well the model fits that data at the community and species level. I believe 0.5 is the target p-value, though how far from this number is considered adequate, I do not know yet. I believe this is a good place to check when thinking about which species we include in the model.
+```{r Model_Validation}
+ppc_ft <- ppcOcc(
+  ms_cover_canopyQ,
+  fit.stat = "freeman-tukey",
+  group = 1
+)
+
+ppc_chisq <- ppcOcc(
+  ms_cover_canopyQ,
+  fit.stat = "chi-square",
+  group = 1
+)
+
+summary(ppc_ft)
+summary(ppc_chisq)
+
+```
+
+## Posterior Checks
+```{r Posterior_Checks}
+n.sp       <- dim(data_list$y)[1]
+n.weeks    <- dim(data_list$y)[3]
+sp.names   <- dimnames(data_list$y)[[1]]
+plot.names <- dimnames(data_list$y)[[2]]
+
+# Named lookup: scientific name -> common name
+common.names <- c(
+  "Canis_latrans"          = "Coyote",
+  "Lynx_rufus"             = "Bobcat",
+  "Procyon_lotor"          = "Raccoon",
+  "Didelphis_virginiana"   = "Virginia Opossum",
+  "Sylvilagus_floridanus"  = "Eastern Cottontail Rabbit",
+  "Meleagris_gallopavo"    = "Wild Turkey",
+  "Sciurus_carolinensis"   = "Grey Squirrel"
+)
+
+# ── Run PPC ───────────────────────────────────────────────────────────────
+# group = 1: fit.y.group.quants = [5 x n.species x n.sites]
+# group = 2: fit.y.group.quants = [5 x n.species x n.weeks]
+
+ppc_ft_site <- ppcOcc(ms_cover_canopyQ, fit.stat = "freeman-tukey", group = 1)
+ppc_ft_week <- ppcOcc(ms_cover_canopyQ, fit.stat = "freeman-tukey", group = 2)
+
+ppc_chisq_site <- ppcOcc(ms_cover_canopyQ, fit.stat = "chi-square", group = 1)
+ppc_chisq_week <- ppcOcc(ms_cover_canopyQ, fit.stat = "chi-square", group = 2)
+
+summary(ppc_ft_site)
+summary(ppc_ft_week)
+summary(ppc_chisq_site)
+summary(ppc_chisq_week)
+
+# ── Scatter plot: replicated vs. observed fit statistic ───────────────────
+
+make_scatter <- function(i) {
+  ppc.df <- data.frame(
+    fit     = ppc_ft_site$fit.y[ , i],
+    fit.rep = ppc_ft_site$fit.y.rep[ , i]
+  )
+  ppc.df$color <- ifelse(ppc.df$fit.rep > ppc.df$fit, "lightsalmon", "lightskyblue1")
+
+  ggplot(ppc.df, aes(x = fit, y = fit.rep)) +
+    geom_point(aes(fill = color), shape = 21, color = "grey40", size = 1.8) +
+    geom_abline(slope = 1, intercept = 0, color = "black") +
+    scale_fill_identity() +
+    labs(
+      title = common.names[sp.names[i]],
+      x = "True", y = "Replicate"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(plot.title = element_text(size = 9))
+}
+
+# ── site-level discrepancy ───────────────────────────────────────────
+make_site_discrepancy <- function(i) {
+  diff.fit <- ppc_ft_site$fit.y.rep.group.quants[3, i, ] -
+              ppc_ft_site$fit.y.group.quants[3, i, ]
+
+  df <- data.frame(
+    x    = seq_along(diff.fit),
+    diff = diff.fit,
+    site = plot.names
+  )
+
+  ggplot(df, aes(x = x, y = diff)) +
+    geom_point(shape = 19, size = 1.8) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    scale_x_continuous(
+      breaks = df$x,
+      labels = df$site
+    ) +
+    labs(
+      title = common.names[sp.names[i]],
+      x = NULL, y = "Replicate - True Discrepancy"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(
+      axis.text.x  = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 6),
+      plot.title   = element_text(size = 9)
+    )
+}
+
+# ── week-level discrepancy ───────────────────────────────────────────
+make_week_discrepancy <- function(i) {
+  diff.fit <- ppc_ft_week$fit.y.rep.group.quants[3, i, ] -
+              ppc_ft_week$fit.y.group.quants[3, i, ]
+
+  df <- data.frame(
+    week = 1:n.weeks,
+    diff = diff.fit
+  )
+
+  ggplot(df, aes(x = week, y = diff)) +
+    geom_point(shape = 19, size = 1.8) +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    scale_x_continuous(breaks = 1:n.weeks) +
+    labs(
+      title = common.names[sp.names[i]],
+      x = "Week", y = "Replicate - True Discrepancy"
+    ) +
+    theme_bw(base_size = 10) +
+    theme(plot.title = element_text(size = 9))
+}
+
+# ── Assemble panels with patchwork ───────────────────────────────────────────
+assemble_panel <- function(plot_fn, title_label) {
+  plots <- lapply(seq_len(n.sp), plot_fn)
+  wrap_plots(plots, ncol = ceiling(n.sp / 2)) +
+    plot_annotation(title = title_label,
+                    theme = theme(plot.title = element_text(size = 12, face = "bold")))
+}
+
+panel_scatter  <- assemble_panel(make_scatter,           "")
+panel_site     <- assemble_panel(make_site_discrepancy,  "")
+panel_week     <- assemble_panel(make_week_discrepancy,  "")
+
+# ── Stack the three panels and save ──────────────────────────────────────────
+ggsave(
+  filename = "ppc_scatter.png",
+  plot     = panel_scatter,
+  width    = 12,
+  height   = 9,
+  dpi      = 300
+)
+
+ggsave(
+  filename = "ppc_site_discrepancy.png",
+  plot     = panel_site,
+  width    = 12,
+  height   = 9,
+  dpi      = 300
+)
+
+ggsave(
+  filename = "ppc_week_discrepancy.png",
+  plot     = panel_week,
+  width    = 12,
+  height   = 9,
+  dpi      = 300
+)
+```
+
+
+## Proability of Direction- Occupancy
+```{r Probability_Direction_occ}
+pd <- function(x) {
+  max(mean(x > 0), mean(x < 0))
+}
+
+
+pd_table <- apply(
+  ms_cover_canopyQ$beta.samples,
+  2,
+  pd
+)
+
+head(pd_table)
+
+beta_means <- colMeans(ms_cover_canopyQ$beta.samples)
+
+beta_samps <- ms_cover_canopyQ$beta.samples
+
+pd_vals <- apply(beta_samps, 2, pd)
+beta_means <- colMeans(beta_samps)
+
+# extract specific quantiles
+get_quantile <- function(samples, prob) {
+  apply(samples, 2, quantile, probs = prob)
+}
+
+results_species <- data.frame(
+  parameter     = colnames(beta_samps),
+  mean          = beta_means,
+  pd            = pd_vals,
+  lower_95_cri  = get_quantile(beta_samps, 0.025),
+  upper_95_cri  = get_quantile(beta_samps, 0.975)
+)
+
+head(results_species)
+
+beta_comm <- ms_cover_canopyQ$beta.comm.samples
+
+results_comm <- data.frame(
+  parameter     = colnames(beta_comm),
+  mean          = colMeans(beta_comm),
+  pd            = apply(beta_comm, 2, pd),
+  lower_95_cri  = get_quantile(beta_comm, 0.025),
+  upper_95_cri  = get_quantile(beta_comm, 0.975)
+)
+
+results_comm$pd_95 <- results_comm$pd >= 0.95
+
+
+doc <- read_docx()
+
+
+ft_species <- flextable(results_species) %>%
+  colformat_double(digits = 4) %>%
+  set_header_labels(
+    parameter    = "Parameter",
+    mean         = "Mean",
+    pd           = "pd",
+    lower_95_cri = "Lower 95% CrI",
+    upper_95_cri = "Upper 95% CrI"
+  ) %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  bold(i = ~ pd >= 0.95, bold = TRUE, part = "body")
+
+doc <- doc %>%
+  body_add_par("Species-Level Results", style = "heading 1") %>%
+  body_add_par("", style = "Normal") %>%
+  body_add_flextable(ft_species)
+
+
+ft_comm <- flextable(results_comm) %>%
+  colformat_double(digits = 4) %>%
+  set_header_labels(
+    parameter    = "Parameter",
+    mean         = "Mean",
+    pd           = "pd",
+    lower_95_cri = "Lower 95% CrI",
+    upper_95_cri = "Upper 95% CrI"
+  ) %>%
+  theme_booktabs() %>%
+  autofit() %>%
+  bold(i = ~ pd >= 0.95, bold = TRUE, part = "body")
+
+doc <- doc %>%
+  body_add_break() %>%
+  body_add_par("Community-Level Results", style = "heading 1") %>%
+  body_add_par("", style = "Normal") %>%
+  body_add_flextable(ft_comm)
+
+
+print(doc, target = "occ_model_results.docx")
+```
+
+## Probability of Direction- Detection
+```{r Probability_Direction_det}
+pd <- function(x) {
+  max(mean(x > 0), mean(x < 0))
+}
+
+alpha_samps <- ms_cover_canopyQ$alpha.samples
+
+pd_vals_alpha <- apply(alpha_samps, 2, pd)
+alpha_means  <- colMeans(alpha_samps)
+
+results_species_det <- data.frame(
+  parameter = colnames(alpha_samps),
+  mean = alpha_means,
+  pd = pd_vals_alpha,
+  pd_95 = pd_vals_alpha >= 0.95
+)
+
+head(results_species_det)
+
+alpha_comm <- ms_cover_canopyQ$alpha.comm.samples
+
+results_comm_det <- data.frame(
+  parameter = colnames(alpha_comm),
+  mean = colMeans(alpha_comm),
+  pd = apply(alpha_comm, 2, pd)
+)
+
+results_comm_det$pd_95 <- results_comm_det$pd >= 0.95
+
+results_comm_det
+
+```
+
+## Plot Species Occupancy
+```{r Plot_Species_Occupancy, eval=FALSE, include=FALSE}
+summary(ms_cover_canopyQ) # Summary of parameter estimates
+names(ms_cover_canopyQ)
+str(ms_cover_canopyQ$beta.samples)
+
+mean(ms_cover_canopyQ$beta.samples[, 5] > 0)
+
+MCMCplot(ms_cover_canopyQ$beta.samples, ref_ovl = TRUE, ci = c(50, 95)) # Occupancy
+MCMCplot(ms_cover_canopyQ$alpha.samples, ref_ovl = TRUE, ci = c(50, 95)) # Detection
+
+# unscaled cogongrass values
+cogon.pred.vals <- seq(min(data_list$occ.covs$Avg_Cogongrass_Cover),
+                       max(data_list$occ.covs$Avg_Cogongrass_Cover),
+                       length.out = 100)
+
+# Scale using the same transformation used in the model
+cogon.mean <- mean(data_list$occ.covs$Avg_Cogongrass_Cover)
+cogon.sd   <- sd(data_list$occ.covs$Avg_Cogongrass_Cover)
+
+cogon.pred.scale <- (cogon.pred.vals - cogon.mean) / cogon.sd
+
+# quadratic term (scaled^2)
+cogon.pred.scale2 <- cogon.pred.scale^2
+
+# Prediction matrix
+pred.df <- as.matrix(data.frame(
+  intercept = 1,
+  Avg_Cogongrass_Cover = cogon.pred.scale,
+  I.Avg_Cogongrass_Cover.2. = cogon.pred.scale2,
+ # CWD_presence = 0,
+ # Cogon_Patch_Size = 0,
+#  Veg_shannon_index = 0,
+#  total_shrub_cover = 0,
+#  Tree_Density = 0,
+  Avg_Canopy_Cover = 0
+#  avg_veg_height = 0,
+#  Auth = 0
+))
+
+
+# Predict occupancy from the model
+out.pred <- predict(ms_cover_canopyQ,
+                    X.0 = pred.df,
+                    ignore.RE = TRUE)
+
+
+# Convert posterior samples to quantiles
+psi.0.quants <- apply(out.pred$psi.0.samples, 3,
+                      function(x) quantile(x, prob = c(0.025, 0.5, 0.975)))
+
+# Format for plotting
+psi.plot.dat <- data.frame(
+  psi.med = psi.0.quants[2, ],
+  psi.low = psi.0.quants[1, ],
+  psi.high = psi.0.quants[3, ],
+  Avg_Cogongrass_Cover = cogon.pred.vals
+)
+
+# Plot
+ggplot(psi.plot.dat, aes(x = Avg_Cogongrass_Cover, y = psi.med)) +
+  geom_ribbon(aes(ymin = psi.low, ymax = psi.high), fill = "grey70") +
+  geom_line(size = 1.1) +
+  theme_bw() +
+  labs(x = "Average Cogongrass Cover (%)", y = "Predicted Occupancy") +
+  scale_y_continuous(limits = c(0,1))
+
+
+```
+
+
+
+## Batched Parameter Estimates
+```{r Batched_Parameter_Estimates}
+summary(ms_cover_canopyQ) # Summary of parameter estimates
+names(ms_cover_canopyQ)
+str(ms_cover_canopyQ$beta.samples)
+
+mean(ms_cover_canopyQ$beta.samples[, 5] > 0)
+
+MCMCplot(ms_cover_canopyQ$beta.samples, ref_ovl = TRUE, ci = c(50, 95)) # Occupancy
+MCMCplot(ms_cover_canopyQ$alpha.samples, ref_ovl = TRUE, ci = c(50, 95)) # Detection
+
+## Occupancy
+# Total number of parameters
+n_params <- ncol(ms_cover_canopyQ$beta.samples)
+
+# Number of parameters to plot at a time
+chunk_size <- 10
+
+# Split and plot
+for (i in seq(1, n_params, by = chunk_size)) {
+  end <- min(i + chunk_size - 1, n_params)
+  param_names <- colnames(ms_cover_canopyQ$beta.samples)[i:end]
+  
+  # Set filename
+  file_name <- paste0("MCMCplot_Occupancy_Params_", i, "_to_", end, ".png")
+  
+  # Save plot to PNG
+  png(filename = file_name, width = 1200, height = 800, res = 150)
+  
+  MCMCplot(ms_cover_canopyQ$beta.samples[, param_names],
+           ref_ovl = TRUE,
+           ci = c(50, 95),
+           main = paste0("Occupancy Parameters: ", i, " to ", end))
+  
+  dev.off()
+}
+
+
+## Detection 
+# Number of parameters
+n_params <- ncol(ms_cover_canopyQ$alpha.samples)
+
+# Number of parameters to plot at a time
+chunk_size <- 10
+
+# Split and plot
+for (i in seq(1, n_params, by = chunk_size)) {
+  end <- min(i + chunk_size - 1, n_params)
+  param_names <- colnames(ms_cover_canopyQ$alpha.samples)[i:end]
+  
+  # Set filename
+  file_name <- paste0("MCMCplot_Detection_Params_", i, "_to_", end, ".png")
+  
+  # Save plot to PNG
+  png(filename = file_name, width = 1200, height = 800, res = 150)
+  
+  MCMCplot(ms_cover_canopyQ$alpha.samples[, param_names, drop = FALSE],
+         ref_ovl = TRUE,
+         ci = c(50, 95),
+         main = paste0("Detection Parameters: ", i, " to ", end))
+  
+  dev.off()
+}
+```
+
+## Facet Plots
+```{r Facet_Plots}
+plot_mcmc_faceted_groups <- function(samples_matrix,
+                                     chunk_size = 8,
+                                     title_text = "Parameters",
+                                     pd_cutoff = 0.95) {
+  
+  param_names <- colnames(samples_matrix)
+  
+  
+  df <- as.data.frame(samples_matrix)
+  df$Iteration <- 1:nrow(df)
+  
+  df_long <- df %>%
+    pivot_longer(-Iteration,
+                 names_to = "Parameter",
+                 values_to = "Value") %>%
+    mutate(
+      ParamIndex = match(Parameter, param_names),
+      Group = ceiling(ParamIndex / chunk_size)
+    )
+  
+  # Posterior summaries + probability of direction
+  summary_df <- df_long %>%
+    group_by(Parameter, Group) %>%
+    summarise(
+      mean = mean(Value),
+      l95 = quantile(Value, 0.025),
+      u95 = quantile(Value, 0.975),
+      l50 = quantile(Value, 0.25),
+      u50 = quantile(Value, 0.75),
+      pd = max(mean(Value > 0), mean(Value < 0)),
+      .groups = "drop"
+    ) %>%
+    mutate(
+      Credible = pd >= pd_cutoff
+    )
+  
+  
+  summary_df <- summary_df %>%
+    group_by(Group) %>%
+    mutate(Parameter = factor(Parameter,
+                               levels = rev(unique(Parameter)))) %>%
+    ungroup()
+  
+  
+  ggplot(summary_df,
+         aes(x = mean, y = Parameter)) +
+    
+    geom_vline(xintercept = 0, linetype = "dashed") +
+    
+    # 95% CI
+    geom_errorbarh(aes(xmin = l95,
+                       xmax = u95,
+                       size = Credible),
+                   height = 0) +
+    
+    # 50% CI
+    geom_errorbarh(aes(xmin = l50,
+                       xmax = u50,
+                       size = Credible),
+                   height = 0) +
+    
+    # Posterior mean
+    geom_point(aes(fill = Credible),
+               shape = 21,
+               size = 3,
+               stroke = 1) +
+    
+    facet_wrap(~Group, scales = "free_y", ncol = 2) +
+    
+    scale_size_manual(values = c("TRUE" = 1.2,
+                                 "FALSE" = 0.5),
+                      guide = "none") +
+    
+    scale_fill_manual(values = c("TRUE" = "black",
+                                 "FALSE" = "white"),
+                      guide = "none") +
+    
+    labs(x = "Parameter Estimate",
+         y = "",
+         title = title_text) +
+    
+    theme_bw() +
+    theme(
+      strip.background = element_blank(),
+      strip.text = element_blank(), 
+      axis.text.y = element_text(size = 10)
+    )
+}
+
+plot_mcmc_faceted_groups(
+  ms_cover_canopyQ$beta.samples,
+  chunk_size = 8,
+  title_text = "",
+  pd_cutoff = 0.95
+)
+
+ggsave("mcmc_faceted_groups_occupancy.png",
+       width = 10, height = 8, dpi = 300)
+
+plot_mcmc_faceted_groups(
+  ms_cover_canopyQ$alpha.samples,
+  chunk_size = 8,
+  title_text = "",
+  pd_cutoff = 0.95
+)
+
+ggsave("mcmc_faceted_groups_detection.png",
+       width = 10, height = 8, dpi = 300)
+
+```
+
+
+# Plot Species level relationship with cogongrass cover
+```{r Species_Level_Cogon}
+# Collecting scaled atrributes
+cogon.mean <- attr(covariates_matrix, "scaled:center")["Avg_Cogongrass_Cover"]
+cogon.sd <- attr(covariates_matrix, "scaled:scale")["Avg_Cogongrass_Cover"]
+
+cogon.mean <- mean(CameraLoc$Avg_Cogongrass_Cover)
+cogon.sd <- sd(CameraLoc$Avg_Cogongrass_Cover)
+
+# Unscaled prediction values
+cogon.pred.vals <- seq(0, 100, length.out = 100)
+
+# Scale prediction values
+cogon.pred.scale <- (cogon.pred.vals - cogon.mean) / cogon.sd
+cogon.pred.scale2 <- cogon.pred.scale^2
+
+canopy.mean <- attr(covariates_matrix, "scaled:center")["Avg_Canopy_Cover"]
+canopy.sd <- attr(covariates_matrix, "scaled:scale")["Avg_Canopy_Cover"]
+
+pred.df <- as.matrix(data.frame(
+  intercept = 1,
+  Avg_Cogongrass_Cover = cogon.pred.scale,
+  I.Avg_Cogongrass_Cover.2. = cogon.pred.scale2,
+  Avg_Canopy_Cover = 0  
+))
+
+out.pred <- predict(
+  ms_cover_canopyQ,
+  X.0 = pred.df,
+  ignore.RE = TRUE
+)
+
+
+# Extract the species-specific betas for Coyote
+coyote_index <- which(ms_cover_canopyQ$sp.names == "Canis_latrans")
+
+# Get column indices for the parameters we need
+intercept_col <- paste0("(Intercept)-", "Canis_latrans")
+cogon_col <- paste0("Avg_Cogongrass_Cover-", "Canis_latrans")
+cogon2_col <- paste0("I(Avg_Cogongrass_Cover^2)-", "Canis_latrans")
+canopy_col <- paste0("Avg_Canopy_Cover-", "Canis_latrans")
+
+# Extract posterior samples for each coefficient
+beta_intercept <- ms_cover_canopyQ$beta.samples[, intercept_col]
+beta_cogon <- ms_cover_canopyQ$beta.samples[, cogon_col]
+beta_cogon2 <- ms_cover_canopyQ$beta.samples[, cogon2_col]
+beta_canopy <- ms_cover_canopyQ$beta.samples[, canopy_col]
+
+# Create prediction gradient (0 to 100%)
+cogon.pred.vals <- seq(0, 100, length.out = 1000)
+
+# Scale using same transformation
+cogon.pred.scale <- (cogon.pred.vals - cogon.mean) / cogon.sd
+cogon.pred.scale2 <- cogon.pred.scale^2
+
+n_samples <- nrow(ms_cover_canopyQ$beta.samples)
+n_pred <- length(cogon.pred.vals)
+
+logit_psi <- matrix(NA, nrow = n_samples, ncol = n_pred)
+
+for(i in 1:n_samples) {
+  logit_psi[i, ] <- beta_intercept[i] + 
+                    beta_cogon[i] * cogon.pred.scale + 
+                    beta_cogon2[i] * cogon.pred.scale2 + 
+                    beta_canopy[i] * 0  # Setting to mean (0 on scaled)
+}
+
+# Convert to probability scale
+psi_samples <- plogis(logit_psi)
+
+# Calculate quantiles across MCMC samples for each prediction point
+psi.coyote.quants <- apply(psi_samples, 2, quantile, 
+                            probs = c(0.025, 0.5, 0.975))
+
+psi.coyote.dat <- data.frame(
+  Avg_Cogongrass_Cover = cogon.pred.vals,
+  psi.low  = psi.coyote.quants[1, ],
+  psi.med  = psi.coyote.quants[2, ],
+  psi.high = psi.coyote.quants[3, ]
+)
+
+ggplot(psi.coyote.dat, aes(x = Avg_Cogongrass_Cover, y = psi.med)) +
+  geom_ribbon(aes(ymin = psi.low, ymax = psi.high), fill = "grey70", alpha = 0.5) +
+  geom_line(size = 1.2) +
+  theme_bw() +
+  labs(x = "Average Cogongrass Cover (%)",
+       y = "Occupancy Probability (Canis latrans)") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(limits = c(0, 100))
+
+summary(psi.coyote.dat)
+```
+
+
+## Community Occupancy
+```{r Plot_Community_Occupancy}
+# Community-level (average across species)
+comm_intercept <- ms_cover_canopyQ$beta.comm.samples[, "(Intercept)"]
+comm_cogon <- ms_cover_canopyQ$beta.comm.samples[, "Avg_Cogongrass_Cover"]
+comm_cogon2 <- ms_cover_canopyQ$beta.comm.samples[, "I(Avg_Cogongrass_Cover^2)"]
+comm_canopy <- ms_cover_canopyQ$beta.comm.samples[, "Avg_Canopy_Cover"]
+
+# Same prediction approach
+logit_psi_comm <- matrix(NA, nrow = nrow(ms_cover_canopyQ$beta.comm.samples), 
+                         ncol = n_pred)
+
+for(i in 1:nrow(ms_cover_canopyQ$beta.comm.samples)) {
+  logit_psi_comm[i, ] <- comm_intercept[i] + 
+                         comm_cogon[i] * cogon.pred.scale + 
+                         comm_cogon2[i] * cogon.pred.scale2 + 
+                         comm_canopy[i] * 0
+}
+
+psi_comm_samples <- plogis(logit_psi_comm)
+
+psi.comm.quants <- apply(psi_comm_samples, 2, quantile, 
+                         probs = c(0.025, 0.5, 0.975))
+
+psi.comm.dat <- data.frame(
+  Avg_Cogongrass_Cover = cogon.pred.vals,
+  psi.low  = psi.comm.quants[1, ],
+  psi.med  = psi.comm.quants[2, ],
+  psi.high = psi.comm.quants[3, ]
+)
+
+ggplot(psi.comm.dat, aes(x = Avg_Cogongrass_Cover, y = psi.med)) +
+  geom_ribbon(aes(ymin = psi.low, ymax = psi.high), fill = "grey70", alpha = 0.5) +
+  geom_line(size = 1.2) +
+  theme_bw() +
+  labs(x = "Average Cogongrass Cover (%)",
+       y = "Community Occupancy Probability") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(limits = c(0, 100))
+
+
+```
+
+
+## Loop through all species in the community
+```{r Loop_Species_Occupancy}
+# Prediction gradient
+cogon.pred.vals <- seq(0, 100, length.out = 1000)
+cogon.pred.scale <- (cogon.pred.vals - cogon.mean) / cogon.sd
+cogon.pred.scale2 <- cogon.pred.scale^2
+
+n_samples <- nrow(ms_cover_canopyQ$beta.samples)
+n_pred <- length(cogon.pred.vals)
+
+# List to store results
+species_predictions <- list()
+species_plots <- list()
+
+# Loop through all species
+for(sp in ms_cover_canopyQ$sp.names) {
+  
+  # Get column names for this species
+  intercept_col <- paste0("(Intercept)-", sp)
+  cogon_col <- paste0("Avg_Cogongrass_Cover-", sp)
+  cogon2_col <- paste0("I(Avg_Cogongrass_Cover^2)-", sp)
+  canopy_col <- paste0("Avg_Canopy_Cover-", sp)
+  
+  # Extract posterior samples
+  beta_intercept <- ms_cover_canopyQ$beta.samples[, intercept_col]
+  beta_cogon <- ms_cover_canopyQ$beta.samples[, cogon_col]
+  beta_cogon2 <- ms_cover_canopyQ$beta.samples[, cogon2_col]
+  beta_canopy <- ms_cover_canopyQ$beta.samples[, canopy_col]
+  
+  # Calculate linear predictor
+  logit_psi <- matrix(NA, nrow = n_samples, ncol = n_pred)
+  
+  for(i in 1:n_samples) {
+    logit_psi[i, ] <- beta_intercept[i] + 
+                      beta_cogon[i] * cogon.pred.scale + 
+                      beta_cogon2[i] * cogon.pred.scale2 + 
+                      beta_canopy[i] * 0
+  }
+  
+  # Convert to probability
+  psi_samples <- plogis(logit_psi)
+  
+  # Calculate quantiles
+  psi.quants <- apply(psi_samples, 2, quantile, probs = c(0.025, 0.5, 0.975))
+  
+  # Store results
+  species_predictions[[sp]] <- data.frame(
+    species = sp,
+    Avg_Cogongrass_Cover = cogon.pred.vals,
+    psi.low  = psi.quants[1, ],
+    psi.med  = psi.quants[2, ],
+    psi.high = psi.quants[3, ]
+  )
+  
+  # Create plot
+  species_plots[[sp]] <- ggplot(species_predictions[[sp]], 
+                                 aes(x = Avg_Cogongrass_Cover, y = psi.med)) +
+    geom_ribbon(aes(ymin = psi.low, ymax = psi.high), fill = "grey70", alpha = 0.5) +
+    geom_line(size = 1.2) +
+    theme_bw() +
+    labs(x = "Average Cogongrass Cover (%)",
+         y = "Occupancy Probability",
+         title = gsub("_", " ", sp)) +  # Replace underscores with spaces
+    scale_y_continuous(limits = c(0, 1)) +
+    scale_x_continuous(limits = c(0, 100))
+}
+
+# View individual plots
+species_plots[["Canis_latrans"]]
+species_plots[["Procyon_lotor"]]
+
+# Combine all plots into a grid
+all_species_plot <- wrap_plots(species_plots, ncol = 4)
+all_species_plot
+
+# Save combined plot
+ggsave("all_species_cogongrass_response.png", 
+       all_species_plot, 
+       width = 12, height = 16, dpi = 300)
+
+# Combine all predictions into one dataframe for faceted plot
+all_predictions <- do.call(rbind, species_predictions)
+
+# Create faceted plot
+faceted_plot <- ggplot(all_predictions, aes(x = Avg_Cogongrass_Cover, y = psi.med)) +
+  geom_ribbon(aes(ymin = psi.low, ymax = psi.high), fill = "grey70", alpha = 0.5) +
+  geom_line(size = 1.2) +
+  facet_wrap(~ species, ncol = 2, labeller = labeller(species = function(x) gsub("_", " ", x))) +
+  theme_bw() +
+  labs(x = "Average Cogongrass Cover (%)",
+       y = "Occupancy Probability") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(limits = c(0, 100)) +
+  theme(strip.text = element_text(face = "italic"))  # Italicize species names
+
+faceted_plot
+
+ggsave("all_species_faceted.png", 
+       faceted_plot, 
+       width = 10, height = 12, dpi = 300)
+```
+
+## Species Lookup
+```{r Species_Lookup}
+SpeciesLookup <- tibble::tribble(
+  ~Name, ~Scientific_Name, ~Common_Name,
+  "Canis_latrans", "Canis latrans", "Coyote",
+  "Didelphis_virginiana", "Didelphis virginiana", "Virginia Opossum",
+  "Procyon_lotor", "Procyon lotor", "Raccoon",
+  "Lynx_rufus", "Lynx rufus", "Bobcat",
+  "Meleagris_gallopavo", "Meleagris gallopavo", "Wild Turkey",
+  "Sciurus_carolinensis", "Sciurus carolinensis", "Eastern Gray Squirrel",
+  "Sylvilagus_floridanus", "Sylvilagus floridanus", "Eastern Cottontail Rabbit",
+)
+
+```
+
+## Varying cogongrass and canopy cover
+```{r Varying_Cogon_Canopy}
+# Prediction gradient for cogongrass
+cogon.pred.vals <- seq(0, 100, length.out = 1000)
+cogon.pred.scale <- (cogon.pred.vals - cogon.mean) / cogon.sd
+cogon.pred.scale2 <- cogon.pred.scale^2
+
+# Define canopy cover scenarios with factor levels
+canopy_scenarios <- data.frame(
+  scenario = factor(c("Low", "Average", "High"),
+                   levels = c("Low", "Average", "High")),
+  canopy_scaled = c(-1, 0, 1),
+  color = c("#D55E00", "#009E73", "#0072B2")
+)
+
+n_samples <- nrow(ms_cover_canopyQ$beta.samples)
+n_pred <- length(cogon.pred.vals)
+
+# Lists for results
+species_predictions <- list()
+species_plots <- list()
+
+# Loop through all species
+for(sp in ms_cover_canopyQ$sp.names) {
+  
+  # Get column names for this species
+  intercept_col <- paste0("(Intercept)-", sp)
+  cogon_col <- paste0("Avg_Cogongrass_Cover-", sp)
+  cogon2_col <- paste0("I(Avg_Cogongrass_Cover^2)-", sp)
+  canopy_col <- paste0("Avg_Canopy_Cover-", sp)
+  
+  # Extract posterior samples
+  beta_intercept <- ms_cover_canopyQ$beta.samples[, intercept_col]
+  beta_cogon <- ms_cover_canopyQ$beta.samples[, cogon_col]
+  beta_cogon2 <- ms_cover_canopyQ$beta.samples[, cogon2_col]
+  beta_canopy <- ms_cover_canopyQ$beta.samples[, canopy_col]
+  
+  # Store predictions for each canopy scenario
+  scenario_predictions <- list()
+  
+  for(j in 1:nrow(canopy_scenarios)) {
+    
+    canopy_val <- canopy_scenarios$canopy_scaled[j]
+    
+    # Calculate linear predictor
+    logit_psi <- matrix(NA, nrow = n_samples, ncol = n_pred)
+    
+    for(i in 1:n_samples) {
+      logit_psi[i, ] <- beta_intercept[i] + 
+                        beta_cogon[i] * cogon.pred.scale + 
+                        beta_cogon2[i] * cogon.pred.scale2 + 
+                        beta_canopy[i] * canopy_val
+    }
+    
+    # Convert to probability
+    psi_samples <- plogis(logit_psi)
+    
+    # Calculate quantiles
+    psi.quants <- apply(psi_samples, 2, quantile, probs = c(0.025, 0.5, 0.975))
+    
+    # Store results
+    scenario_predictions[[j]] <- data.frame(
+      species = sp,
+      scenario = canopy_scenarios$scenario[j],
+      Avg_Cogongrass_Cover = cogon.pred.vals,
+      psi.low  = psi.quants[1, ],
+      psi.med  = psi.quants[2, ],
+      psi.high = psi.quants[3, ]
+    )
+  }
+  
+  # Combine all scenarios
+  species_predictions[[sp]] <- do.call(rbind, scenario_predictions)
+  
+  all_predictions <- all_predictions %>%
+  left_join(SpeciesLookup, by = c("species" = "Name"))
+  # Create plot
+  species_plots[[sp]] <- ggplot(species_predictions[[sp]], 
+                                 aes(x = Avg_Cogongrass_Cover, y = psi.med, 
+                                     color = scenario, fill = scenario)) +
+    geom_ribbon(aes(ymin = psi.low, ymax = psi.high), alpha = 0.2, color = NA) +
+    geom_line(size = 1.2) +
+    scale_color_manual(values = canopy_scenarios$color) +
+    scale_fill_manual(values = canopy_scenarios$color) +
+    theme_bw() +
+    labs(x = "Average Cogongrass Cover (%)",
+         y = "Occupancy Probability",
+         title = gsub("_", " ", sp),
+         color = "Canopy Cover",
+         fill = "Canopy Cover") +
+    scale_y_continuous(limits = c(0, 1)) +
+    scale_x_continuous(limits = c(0, 100)) +
+    theme(
+  legend.position = "bottom",
+  axis.text = element_text(size = 14),
+  axis.title = element_text(size = 16),
+  plot.title = element_text(size = 16),
+  legend.text = element_text(size = 13),
+  legend.title = element_text(size = 14)
+)
+  
+}
+
+# View individual plots
+species_plots[["Canis_latrans"]]
+species_plots[["Procyon_lotor"]]
+
+# Combine all plots into a grid
+all_species_plot <- wrap_plots(species_plots, ncol = 2, guides = "collect") & 
+  theme(legend.position = "bottom")
+
+all_species_plot
+
+
+ggsave("all_species_cogongrass_canopy.png", 
+       all_species_plot, 
+       width = 14, height = 16, dpi = 300)
+
+# Combine all predictions into one dataframe
+all_predictions <- do.call(rbind, species_predictions)
+
+all_predictions <- all_predictions %>%
+  left_join(
+    SpeciesLookup %>% dplyr::select(Name, Common_Name),
+    by = c("species" = "Name")
+  )
+
+all_predictions$scenario <- factor(all_predictions$scenario,
+                                   levels = c("Low", "Average", "High"))
+
+# Create faceted plot
+faceted_plot <- ggplot(all_predictions, 
+                       aes(x = Avg_Cogongrass_Cover, y = psi.med, 
+                           color = scenario, fill = scenario)) +
+  geom_ribbon(aes(ymin = psi.low, ymax = psi.high), alpha = 0.2, color = NA) +
+  geom_line(size = 1.2) +
+  facet_wrap(~ Common_Name, ncol = 2) +
+  scale_color_manual(values = canopy_scenarios$color) +
+  scale_fill_manual(values = canopy_scenarios$color) +
+  theme_bw() +
+  labs(x = "Average Cogongrass Cover (%)",
+       y = "Occupancy Probability",
+       color = "Canopy Cover",
+       fill = "Canopy Cover") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(limits = c(0, 100)) +
+  theme(
+  strip.text = element_text(face = "bold", size = 14),
+  legend.position = "bottom",
+  axis.text = element_text(size = 14),
+  axis.title = element_text(size = 16),
+  legend.text = element_text(size = 13),
+  legend.title = element_text(size = 14)
+)
+
+
+faceted_plot
+
+
+ggsave("all_species_faceted_canopy.png", 
+       faceted_plot, 
+       width = 12, height = 14, dpi = 600)
+
+```
+
+## Community Occupancy Plot- Cogongrass and Canopy Cover
+```{r Community_Cogon_Canopy}
+# Prediction gradient for cogongrass
+cogon.pred.vals <- seq(0, 100, length.out = 1000)
+cogon.pred.scale <- (cogon.pred.vals - cogon.mean) / cogon.sd
+cogon.pred.scale2 <- cogon.pred.scale^2
+
+# Define canopy cover scenarios
+canopy_scenarios <- data.frame(
+  scenario = c("Low", "Average", "High"),
+  canopy_scaled = c(-1, 0, 1),
+  color = c("#D55E00", "#009E73", "#0072B2")
+)
+
+n_pred <- length(cogon.pred.vals)
+
+# Get community-level parameters
+comm_intercept <- ms_cover_canopyQ$beta.comm.samples[, "(Intercept)"]
+comm_cogon <- ms_cover_canopyQ$beta.comm.samples[, "Avg_Cogongrass_Cover"]
+comm_cogon2 <- ms_cover_canopyQ$beta.comm.samples[, "I(Avg_Cogongrass_Cover^2)"]
+comm_canopy <- ms_cover_canopyQ$beta.comm.samples[, "Avg_Canopy_Cover"]
+
+# Store predictions for each canopy scenario
+community_predictions <- list()
+
+for(j in 1:nrow(canopy_scenarios)) {
+  
+  canopy_val <- canopy_scenarios$canopy_scaled[j]
+  
+  # Calculate linear predictor
+  logit_psi_comm <- matrix(NA, 
+                           nrow = nrow(ms_cover_canopyQ$beta.comm.samples), 
+                           ncol = n_pred)
+  
+  for(i in 1:nrow(ms_cover_canopyQ$beta.comm.samples)) {
+    logit_psi_comm[i, ] <- comm_intercept[i] + 
+                           comm_cogon[i] * cogon.pred.scale + 
+                           comm_cogon2[i] * cogon.pred.scale2 + 
+                           comm_canopy[i] * canopy_val
+  }
+  
+  # Convert to probability
+  psi_comm_samples <- plogis(logit_psi_comm)
+  
+  # Calculate quantiles
+  psi.comm.quants <- apply(psi_comm_samples, 2, quantile, 
+                           probs = c(0.025, 0.5, 0.975))
+  
+  # Store results
+  community_predictions[[j]] <- data.frame(
+    scenario = canopy_scenarios$scenario[j],
+    Avg_Cogongrass_Cover = cogon.pred.vals,
+    psi.low  = psi.comm.quants[1, ],
+    psi.med  = psi.comm.quants[2, ],
+    psi.high = psi.comm.quants[3, ]
+  )
+}
+
+# Combine all scenarios
+psi.comm.dat <- do.call(rbind, community_predictions)
+
+# Reorder the scenario factor levels
+psi.comm.dat$scenario <- factor(psi.comm.dat$scenario, 
+                                levels = c("Low", "Average", "High"))
+
+community_plot <- ggplot(psi.comm.dat, 
+                         aes(x = Avg_Cogongrass_Cover, y = psi.med, 
+                             color = scenario, fill = scenario)) +
+  geom_ribbon(aes(ymin = psi.low, ymax = psi.high), alpha = 0.2, color = NA) +
+  geom_line(size = 1.5) +
+  scale_color_manual(values = canopy_scenarios$color) +
+  scale_fill_manual(values = canopy_scenarios$color) +
+  theme_bw(base_size = 14) +
+  labs(x = "Average Cogongrass Cover (%)",
+       y = "Community Occupancy Probability",
+       color = "Canopy Cover",
+       fill = "Canopy Cover") +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(limits = c(0, 100)) +
+  theme(legend.position = "bottom",
+        plot.title = element_text(hjust = 0.5))
+
+community_plot
+
+ggsave("community_cogongrass_canopy.png", 
+       community_plot, 
+       width = 10, height = 7, dpi = 300)
+
+write.csv(psi.comm.dat, "community_predictions_by_canopy.csv", row.names = FALSE)
+```
+
+## Shared Plot
+```{r Shared_Plot}
+psi.comm.dat$species <- "Community"
+psi.comm.dat$Common_Name <- "Community (All Species)"
+
+all_predictions2 <- bind_rows(all_predictions, psi.comm.dat)
+
+facet_labels <- all_predictions2 %>%
+  distinct(Common_Name) %>%
+  arrange(Common_Name) %>%
+  mutate(label = LETTERS[1:n()])
+
+all_predictions2 <- all_predictions2 %>%
+  left_join(facet_labels, by = "Common_Name")
+
+faceted_plot <- ggplot(all_predictions2, 
+                       aes(x = Avg_Cogongrass_Cover, 
+                           y = psi.med, 
+                           color = scenario, 
+                           fill = scenario)) +
+  geom_ribbon(aes(ymin = psi.low, ymax = psi.high), alpha = 0.2, color = NA) +
+  geom_line(size = 1.2) +
+  
+  geom_text(
+    data = facet_labels,
+    aes(x = 5, y = 0.95, label = label),
+    inherit.aes = FALSE,
+    fontface = "bold",
+    size = 6
+  ) +
+  
+  facet_wrap(~ Common_Name, ncol = 2) +
+  scale_color_manual(values = canopy_scenarios$color) +
+  scale_fill_manual(values = canopy_scenarios$color) +
+  labs(
+    x = "Average Cogongrass Cover (%)",
+    y = "Occupancy Probability",
+    color = "Canopy Cover",
+    fill = "Canopy Cover"
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(limits = c(0, 100)) +
+  theme_bw() +
+  theme(
+    strip.text = element_text(face = "bold", size = 14),
+    legend.position = "bottom",
+    axis.text = element_text(size = 14),
+    axis.title = element_text(size = 16),
+    legend.text = element_text(size = 13),
+    legend.title = element_text(size = 14)
+  )
+
+print(faceted_plot)
+
+ggsave("all_species_faceted_with_community.png", 
+       faceted_plot, 
+       width = 12, height = 14, dpi = 600)
+
+```

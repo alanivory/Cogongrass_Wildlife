@@ -1,0 +1,964 @@
+---
+title: "C4_O2_Behavior"
+author: "Alan Ivory"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# Set-up
+Install necessary packages and import appropriate data
+
+```{r setup_All}
+pacman::p_load(tidyverse, readxl, raster,
+               vegan, tigris, sf, sjPlot,
+               sp, spOccupancy, ggrepel,
+               lme4, lmerTest, MuMIn,
+               brms, MCMCvis, cmdstanr,
+               lubridate, forcats, tidybayes,
+               ggdist, knitr, kableExtra,
+               officer, flextable, purrr,
+               posterior, patchwork, scales)
+
+# Install dependencies
+#install.packages(c("posterior", "RcppParallel", "jsonlite"))
+
+# Install cmdstanr
+#install.packages("cmdstanr", repos = c("https://mc-stan.org/r-packages/", getOption("repos")))
+
+
+# Tree PCQ Data
+tree_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Tree_PCQ")
+
+# Soil Data
+fuel_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Fuel_Sampling")
+
+# Veg Data
+Veg_Cover <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                        sheet = "Veg_Cover")
+
+# Shrub Cover Data
+shrub_data <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/05_SharedData/Field_Data_FL_AL_MS.xlsx",
+                         sheet = "Shrub_Cover")
+
+# Site Data
+CameraData <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/04_Wildlife/02_Data/CameraData.xlsx")
+
+CameraLoc <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/04_Wildlife/02_Data/CameraLoc.xlsx",
+                  sheet = "CameraLocations")
+
+# Add effort data
+effort_matrix <- read_excel("C:/Users/DrewIvory/OneDrive - University of Florida/Desktop/School/PHD/01_Projects/04_Wildlife/02_Data/CameraLoc.xlsx",
+                            sheet = "Effort_Matrix_Full") %>%
+  pivot_longer(cols = matches("^202[4-5]-"), names_to = "week", values_to = "days") %>%
+  filter(days == "7") %>%
+  dplyr::select(Plot, week)
+```
+
+## Number of quadrats sampled per plot
+```{r Quadrats_All}
+# Count the total number of quadrats per plot
+quadrat_count <- Veg_Cover %>%
+  group_by(Plot) %>%
+  summarize(total_quadrats = n_distinct(Quadrat), .groups = "drop")
+```
+
+## Filter All data to only include specified species (Per PLANTS database)
+```{r Filter_All}
+#Filter tree data to only include trees with "tree" in the growth column
+tree_data <- dplyr::filter(tree_data, Growth == "Tree")
+
+#Filter Veg Cover to exclude Shrubs and Trees
+Veg_Cover <- dplyr::filter(Veg_Cover, Growth != "Shrub" & Growth != "Tree")
+
+#Filter Shrub Cover to only include Shrubs and Trees
+shrub_data <- dplyr::filter(shrub_data, Growth == "Shrub" | Growth == "Tree")
+
+```
+
+## Place holder in case we need to filter vegetation by frequency
+```{r RareFilter_All}
+# Total number of sites
+total_sites <- nrow(CameraLoc)
+
+# Function to filter data by frequency
+filter_by_frequency <- function(df) {
+  # Group data by species and calculate the frequency
+  freq <- df %>%
+    group_by(Species) %>%
+    summarise(Frequency = n_distinct(Plot) / nrow(CameraLoc) * 100) %>%
+    filter(Frequency >= 0)
+  
+  # Filter the original data to include only species with frequency >= XX%
+  filtered_df <- df %>%
+    filter(Species %in% freq$Species)
+  
+  return(filtered_df)
+}
+
+# Filter tree data by frequency
+tree_data <- filter_by_frequency(tree_data)
+
+# Filter Veg Cover data by frequency
+Veg_Cover <- filter_by_frequency(Veg_Cover)
+
+# Filter Shrub Cover data by frequency
+shrub_data <- filter_by_frequency(shrub_data)
+
+```
+
+
+
+## Shrub Cover Conversion
+```{r Shrub_Cover_All}
+# Total length of Shrub cover at a site
+shrub_cover <- shrub_data %>%
+  mutate(Cover = Line_End - Line_Start) %>%
+  group_by(Species_Name, Plot) %>%
+  summarise(Shrub_Total_Cover = sum(Cover, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Shrub_Percent_Cover = Shrub_Total_Cover / 3000 * 100)
+
+# Summed length of shrub over at a site
+shrub_cover_summed <- shrub_cover %>%
+  group_by(Plot) %>%
+  summarize(total_shrub_cover = sum(Shrub_Total_Cover, na.rm = TRUE), .groups = "drop")
+
+```
+
+## Herbacous Cover Conversion
+```{r Cogon_Site_All}
+# Combine Plot and Quadrat columns
+Veg_Cover <- Veg_Cover %>%
+  mutate(Plot_Quadrat = paste(Plot, Quadrat, sep = '_'))
+
+# Join with CogonSites to get site information
+Veg_Cover <- Veg_Cover %>%
+  left_join(CameraLoc, by = "Plot")
+
+# Sum species cover across quadrats for each species at each plot
+veg_cover_summed <- Veg_Cover %>%
+  group_by(Plot, Species_Name) %>%
+  summarize(total_cover = sum(Cover_Per, na.rm = TRUE), .groups = "drop")
+
+# Calculate average herbaceous species cover
+avg_species_cover <- veg_cover_summed %>%
+  left_join(quadrat_count, by = "Plot") %>%
+  mutate(avg_cover = total_cover / total_quadrats)
+
+```
+
+## Merging Herb cover with Shrub
+```{r Herb_Shrub_All}
+
+# Merge shrub cover with herbaceous average cover
+combined_cover <- avg_species_cover %>%
+  full_join(
+    shrub_cover %>%
+      dplyr::select(Plot, Species_Name, Shrub_Percent_Cover),
+    by = c("Plot", "Species_Name")
+  ) %>%
+  mutate(
+    overlap_flag = ifelse(!is.na(avg_cover) & !is.na(Shrub_Percent_Cover), TRUE, FALSE), # Flag overlaps
+    final_cover = case_when(
+      !is.na(avg_cover) & is.na(Shrub_Percent_Cover) ~ avg_cover,  # Use herbaceous cover if no shrub data
+      is.na(avg_cover) & !is.na(Shrub_Percent_Cover) ~ Shrub_Percent_Cover, # Use shrub cover if no herbaceous data
+      TRUE ~ NA_real_ # Leave as NA where overlaps exist
+    )
+  )
+
+# Species Matrix
+species_matrix <- combined_cover %>%
+  dplyr::select(Plot, Species_Name, final_cover) %>%
+  pivot_wider(
+    names_from = Species_Name,
+    values_from = final_cover,
+    values_fill = 0
+  )
+```
+
+## Summarize Cogongrass Cover
+```{r Cogon_Cover_All}
+avg_cogongrass_cover <- species_matrix %>%
+  group_by(Plot) %>%
+  summarize(Avg_Cogongrass_Cover = sum(Imperata_cylindrica, na.rm = TRUE) / n(), .groups = "drop")
+
+```
+
+## Herbacous Shannon Diversity Index
+```{r Shannon_Diversity}
+# Summarize species cover by site
+site_species_cover <- Veg_Cover %>%
+  group_by(Plot, Species_Name) %>%
+  summarize(total_cover = sum(Cover_Per, na.rm = TRUE)) %>%
+  ungroup()
+
+# Calculate Shannon diversity per site
+Veg_shannon_diversity <- site_species_cover %>%
+  group_by(Plot) %>%
+  mutate(proportion = total_cover / sum(total_cover)) %>%
+  summarize(Veg_shannon_index = -sum(proportion * log(proportion), na.rm = TRUE))
+
+print(Veg_shannon_diversity)
+```
+
+## Vegetation Height
+```{r Veg_Height_All}
+if (!is.numeric(fuel_data$Height)) {
+  fuel_data$Height <- as.numeric(as.character(fuel_data$Height))
+}
+
+# Calculate average vegetation height per plot
+veg_height <- fuel_data %>%
+  group_by(Plot) %>%
+  summarize(avg_veg_height = mean(Height, na.rm = TRUE), .groups = "drop")
+```
+
+## Tree Metrics
+```{r Tree_Metrics_All}
+# Tree density from point-centered quarter data
+if (!is.numeric(tree_data$Distance)) {
+  tree_data$Distance <- as.numeric(as.character(tree_data$Distance))
+}
+
+tree_density_data <- tree_data %>%
+  group_by(Plot) %>%
+  summarize(Average_Distance = mean(Distance) / 100,  # Convert to meters
+            Tree_Density = 10000 / (Average_Distance^2))  # Convert to trees per hectare
+
+# Average canopy cover from vegetation quadrats
+tree_canopy_data <- Veg_Cover %>%
+  distinct(Plot, Quadrat, .keep_all = TRUE) %>%  # Ensure each quadrat counts once per plot
+  group_by(Plot) %>%
+  summarize(Avg_Canopy_Cover = mean(Canopy_Cover, na.rm = TRUE), .groups = "drop") # Calculate the average canopy cover per plot
+
+cor(tree_density_data$Tree_Density, tree_canopy_data$Avg_Canopy_Cover)
+
+
+```
+
+# Objective 1: Assessing if cogongrass invasion-related factors influence wildlife presence
+
+## Add Covariates
+```{r Cov_Dat}
+CameraLoc <- CameraLoc %>%
+  left_join(Veg_shannon_diversity, by = "Plot") %>%
+  left_join(avg_cogongrass_cover, by = "Plot") %>%
+  left_join(shrub_cover_summed %>% dplyr::select(Plot, total_shrub_cover), by = "Plot") %>%
+  left_join(veg_height, by = "Plot") %>%
+  left_join(tree_density_data %>% dplyr::select(Plot, Tree_Density), by = "Plot") %>%
+  left_join(tree_canopy_data %>% dplyr::select(Plot, Avg_Canopy_Cover), by = "Plot") %>%
+  dplyr::select(-Authority)
+```
+
+## Subset to mammals and turkeys with greater than 10 observations
+```{r Sub_Species}
+# Group by Name and count the number of observations
+species_counts <- CameraData %>%
+  filter(Class == "Mammalia" | 
+  Name == "Meleagris_gallopavo") %>%
+  group_by(Name) %>%
+  summarize(count = n(), .groups = "drop")
+
+# Filter for species with count greater than 10
+species_subset <- species_counts %>%
+  filter(count > 10) %>%
+  pull(Name)
+
+# Filter CameraData to only include species with count > 10
+CameraData <- CameraData %>%
+  filter(Name %in% species_subset)
+```
+
+## Create Detection Matrix
+```{r DetMat}
+# Format Data Weekly
+observations_weekly <- CameraData %>%
+  group_by(Plot, week = format(as.Date(Date), "%Y-%U"), Name) %>%
+  summarise(observations = n(), .groups = 'drop')
+
+# Merge with Effort Matrix to include only valid weeks
+observations_weekly <- effort_matrix %>%
+  left_join(observations_weekly, by = c("Plot" = "Plot", "week")) %>%
+  replace_na(list(observations = 0))
+
+# Convert to wide format
+observations_species <- observations_weekly %>%
+  pivot_wider(names_from = Name, values_from = observations, values_fill = list(observations = 0)) %>%
+  dplyr::select(-"NA")
+
+# Create detection array
+site_names <- sort(unique(observations_species$Plot))
+species_names <- setdiff(colnames(observations_species), c("Plot", "week"))
+
+num_sites <- length(site_names)
+num_weeks <- length(unique(observations_species$week))
+num_species <- length(species_names)
+
+detection_array <- array(0, dim = c(num_sites, num_weeks, num_species))
+dimnames(detection_array) <- list(site_names, unique(observations_species$week), species_names)
+
+for (s in seq_along(species_names)) {
+  species_col <- species_names[s]
+  for (i in seq_along(site_names)) {
+    site <- site_names[i]
+    for (j in seq_along(unique(observations_species$week))) {
+      week <- unique(observations_species$week)[j]
+      detection_array[i, j, s] <- ifelse(
+        any(observations_species$Plot == site & observations_species$week == week & observations_species[[species_col]] > 0),
+        1, 0
+      )
+    }
+  }
+}
+
+dim(detection_array) # Should be num_sites x num_weeks x num_species
+```
+
+## Prepare Site Covariates
+```{r SiteCov}
+# Duplicate CameraLoc to be used later
+CameraLoc_O2 <- CameraLoc
+
+# Standardize the covariates
+CameraLoc <- CameraLoc %>%
+  dplyr::select(-Plot, -Camera, -Lat, -Long, -Status, - Start_Date)
+covariates_matrix <- as.matrix(CameraLoc)
+rownames(covariates_matrix) <- site_names
+
+# Standardizing covariates
+covariates_matrix <- scale(covariates_matrix)
+```
+
+## Combine data into a list
+This requires combining the presence data and the site covariate data into a single list. This also means that the presence data is in a 3-d format.
+```{r Combine_List_Data}
+# Combine into a named list
+data_list <- list(
+  y = detection_array,
+  occ.covs = covariates_matrix,
+  det.covs = covariates_matrix
+)
+```
+
+## Convert occupancy and detection covariates to a dataframe (from matrix)
+```{r Convert_DF}
+# Convert occupancy and detection covariates to a dataframe
+data_list[["occ.covs"]] <- as.data.frame(data_list[["occ.covs"]])
+data_list[["occ.covs"]]$total_shrub_cover <- as.numeric(data_list[["occ.covs"]]$total_shrub_cover)
+
+data_list[["det.covs"]] <- as.data.frame(data_list[["det.covs"]])
+data_list[["det.covs"]]$total_shrub_cover <- as.numeric(data_list[["det.covs"]]$total_shrub_cover)
+
+# Make species the first dimension
+data_list$y <- aperm(data_list$y, c(3, 1, 2))
+
+dimnames(data_list$y) <- list(species = dimnames(data_list$y)[[1]],
+                              site = dimnames(data_list$y)[[2]],
+                              week = dimnames(data_list$y)[[3]])
+
+str(data_list)
+```
+
+# Objective 2: Determine whether wildlife behaviors differ in and around cogongrass patches, specifically as it relates to whether specific taxa avoid cogongrass invaded areas.
+
+## Behavior Occurence
+```{r Behavior_Occurence}
+CameraData <- CameraData%>%
+  dplyr::select(-Status)
+
+O2_data <- CameraData %>%
+  left_join(CameraLoc_O2, by = "Plot")
+
+O2_data <- O2_data %>%
+  mutate(
+    DateTime = update(Date,
+                      hour   = hour(Time),
+                      minute = minute(Time),
+                      second = second(Time))
+  )
+
+gap_mins <- 30
+
+O2_data <- O2_data %>%
+  filter(!is.na(DateTime)) %>%
+  arrange(Plot, Name, DateTime) %>%
+  group_by(Plot, Name) %>%
+  group_modify(~{
+    df <- .x
+    keep <- logical(nrow(df))
+    last_kept <- as.POSIXct(NA, tz = tz(df$DateTime[1]))
+    for (i in seq_len(nrow(df))) {
+      if (is.na(last_kept) || difftime(df$DateTime[i], last_kept, units = "mins") > gap_mins) {
+        keep[i] <- TRUE
+        last_kept <- df$DateTime[i]
+      }
+    }
+    df[keep, , drop = FALSE]
+  }) %>%
+  ungroup()
+
+dat <- O2_data %>%
+  filter(!is.na(Behavior), !is.na(Status), !is.na(BehLoc)) %>%
+  mutate(
+    # time-of-day as proportion of a 24-hour day, then z-score and quadratic
+    time_prop = (hour(DateTime)*3600 + minute(DateTime)*60 + second(DateTime)) / 86400,
+    time_z = as.numeric(scale(time_prop)),
+    time_z2 = time_z^2,
+    # temperature standardized
+    temp_z = as.numeric(scale(Air.TemperatureC)),
+    # month factor to absorb temporal clustering
+    Month = factor(month(DateTime)),
+    # set factor baselines
+    Behavior = factor(Behavior, ordered = FALSE),
+    Behavior = relevel(Behavior, ref = "Local_Search"),
+    Status   = factor(Status, levels = c("Non_Invaded","Invaded")),
+    BehLoc   = factor(BehLoc, levels = c("Non_Patch","Patch")),  # Non_Patch vs Patch
+    Plot     = factor(Plot),
+    Name     = factor(Name),
+    Site     = factor(Site),
+    Camera.Type = factor(Camera.Type)
+  )
+
+```
+
+```{r models}
+priors <- c(
+  prior(normal(0, 1),   class = "b",         dpar = "muForaging"),
+  prior(normal(0, 1),   class = "b",         dpar = "muTransit"),
+  prior(normal(0, 2.5), class = "Intercept", dpar = "muForaging"),
+  prior(normal(0, 2.5), class = "Intercept", dpar = "muTransit"),
+  prior(exponential(1), class = "sd",        dpar = "muForaging"),
+  prior(exponential(1), class = "sd",        dpar = "muTransit")
+)
+
+# Objective 2a: cover effect on behavior across all sites
+model_status <- brm(
+  bf(Behavior ~ Avg_Cogongrass_Cover * Name +
+       (1 | Site) + (1 | Camera.Type) + (1 | Month)),
+  family  = categorical(link = "logit", refcat = "Local_Search"),
+  data    = dat,
+  prior   = priors,
+  chains  = 4, cores = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.95, max_treedepth = 12)
+)
+
+# Objective 2b: does the cover effect differ inside vs outside patches?
+dat_inv <- dat %>% filter(Status == "Invaded")
+
+model_loc <- brm(
+  bf(Behavior ~ BehLoc * Avg_Cogongrass_Cover * Name +
+       (1 | Site) + (1 | Camera.Type) + (1 | Month)),
+  family  = categorical(link = "logit", refcat = "Local_Search"),
+  data    = dat_inv,
+  prior   = priors,
+  chains  = 4, cores = 4, iter = 4000, warmup = 2000,
+  control = list(adapt_delta = 0.95, max_treedepth = 12)
+)
+
+# Diagnostics
+summary(model_status); summary(model_loc)
+loo(model_status);     loo(model_loc)
+```
+
+
+# Helper Functions
+
+```{r helpers}
+# Probability of direction
+pd_fn <- function(x) max(mean(x > 0), mean(x < 0))
+
+# Display labels
+common_names <- c(
+  "Canis_latrans"          = "Coyote",
+  "Odocoileus_virginianus" = "White-Tailed Deer",
+  "Dasypus_novemcinctus"   = "Nine-Banded Armadillo",
+  "Procyon_lotor"          = "Raccoon",
+  "Lynx_rufus"             = "Bobcat",
+  "Didelphis_virginiana"   = "Virginia Opossum",
+  "Sylvilagus_floridanus"  = "Eastern Cottontail Rabbit",
+  "Meleagris_gallopavo"    = "Wild Turkey",
+  "Sciurus_carolinensis"   = "Gray Squirrel"
+)
+
+behavior_colors <- c("Local Search" = "#0072B2",
+                     "Foraging"     = "#009E73",
+                     "Transit"      = "#D55E00")
+location_colors <- c("Non-Patch"    = "#0072B2",
+                     "Patch"        = "#D55E00")
+
+
+save_effect_docx <- function(df, file_name, caption_text) {
+  if (".category" %in% names(df)) {
+    df <- df %>%
+      mutate(Behavior = factor(.category,
+               levels = c("Local_Search", "Foraging", "Transit"),
+               labels = c("Local Search", "Foraging", "Transit"))) %>%
+      dplyr::select(-.category)
+  }
+  if ("Name" %in% names(df)) {
+    df <- df %>%
+      mutate(Species = recode(as.character(Name), !!!common_names)) %>%
+      dplyr::select(-Name)
+  }
+
+  bold_flag <- df$pd >= 0.95
+
+  out <- df %>%
+    mutate(`Median (pp)`   = round(median_pp, 2),
+           pd              = round(pd, 2),
+           `Lower 95% CrI` = round(lower, 2),
+           `Upper 95% CrI` = round(upper, 2)) %>%
+    dplyr::select(any_of(c("Species", "BehLoc", "Behavior")),
+                  `Median (pp)`, pd, `Lower 95% CrI`, `Upper 95% CrI`)
+
+  ft <- flextable(out) %>%
+    set_caption(caption_text) %>%
+    bold(i = which(bold_flag), bold = TRUE) %>%   # bold credible rows
+    autofit()
+  save_as_docx(ft, path = file_name)
+  list(table = out, flextable = ft)
+}
+```
+
+
+# 3. Parameter tables  (APPENDIX — conditional on reference species/behavior)
+
+```{r parameter_tables}
+
+make_pd_table <- function(model, file_name, caption_text) {
+  draws <- as_draws_df(model)
+  beta  <- draws[, grep("^b_", colnames(draws)), drop = FALSE]
+
+
+  tab <- tibble::tibble(
+    parameter = gsub("^b_", "", colnames(beta)),
+    mean      = colMeans(beta),
+    pd        = apply(beta, 2, pd_fn),
+    lower     = apply(beta, 2, quantile, probs = 0.025),
+    upper     = apply(beta, 2, quantile, probs = 0.975)
+  ) %>%
+    mutate(pd_95 = pd >= 0.95)
+
+  disp <- tab %>%
+    transmute(Parameter       = parameter,
+              Mean            = round(mean, 2),
+              pd              = round(pd, 2),
+              `Lower 95% CrI` = round(lower, 2),
+              `Upper 95% CrI` = round(upper, 2))
+
+  ft <- flextable(disp) %>%
+    set_caption(caption_text) %>%
+    bold(i = which(tab$pd_95), bold = TRUE) %>%
+    autofit()
+  save_as_docx(ft, path = file_name)
+  list(table = tab, flextable = ft)
+}
+
+pd_status <- make_pd_table(model_status, "PD_Table_Status_Model.docx",
+                           "Probability of Direction - Status Model")
+pd_loc    <- make_pd_table(model_loc,    "PD_Table_Location_Model.docx",
+                           "Probability of Direction - Location Model")
+
+
+make_pub_table_with_ci <- function(model, pd_table, file_name, caption_text) {
+  ci_df <- as.data.frame(summary(model)$fixed) %>%
+    tibble::rownames_to_column("parameter") %>%
+    dplyr::select(parameter, Estimate, `l-95% CI`, `u-95% CI`) %>%
+    rename(mean = Estimate, l_95 = `l-95% CI`, u_95 = `u-95% CI`)
+
+  df_pub <- pd_table %>%
+    dplyr::select(parameter, pd) %>%
+    left_join(ci_df, by = "parameter") %>%
+    mutate(bold_flag       = pd >= 0.95,           
+           Mean            = round(mean, 2),
+           pd              = round(pd, 2),
+           `Lower 95% CrI` = round(l_95, 2),
+           `Upper 95% CrI` = round(u_95, 2)) %>%
+    dplyr::select(Parameter = parameter, Mean, pd,
+                  `Lower 95% CrI`, `Upper 95% CrI`, bold_flag)
+
+  ft <- flextable(df_pub %>% dplyr::select(-bold_flag)) %>%
+    set_caption(caption_text) %>%
+    bold(i = which(df_pub$bold_flag), j = 1:5, bold = TRUE) %>%
+    autofit()
+  save_as_docx(ft, path = file_name)
+  ft
+}
+
+ft_status <- make_pub_table_with_ci(model_status, pd_status$table,
+              "Status_Model_Parameters_CI.docx",
+              "Status Model Parameter Estimates with 95% Credible Intervals")
+ft_loc    <- make_pub_table_with_ci(model_loc, pd_loc$table,
+              "Location_Model_Parameters_CI.docx",
+              "Location Model Parameter Estimates with 95% Credible Intervals")
+```
+
+
+# 4. Effect tables
+
+```{r effect_tables_status}
+cover_lo <- min(dat$Avg_Cogongrass_Cover, na.rm = TRUE)
+cover_hi <- max(dat$Avg_Cogongrass_Cover, na.rm = TRUE)
+
+newdata_effect <- expand_grid(
+  cover_level = c("low", "high"),
+  Name        = unique(dat$Name)
+) %>%
+  mutate(Avg_Cogongrass_Cover = ifelse(cover_level == "low", cover_lo, cover_hi),
+         Site = NA, Camera.Type = NA, Month = NA)
+
+eff_draws <- add_epred_draws(newdata_effect, model_status, re_formula = NA) %>%
+  ungroup()
+
+# Community-level
+community_effect <- eff_draws %>%
+  group_by(.draw, .category, cover_level) %>%
+  summarise(.epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = cover_level, values_from = .epred) %>%
+  mutate(delta = high - low) %>%
+  group_by(.category) %>%
+  summarise(median_pp = median(delta) * 100,
+            lower = quantile(delta, .025) * 100,
+            upper = quantile(delta, .975) * 100,
+            pd    = pd_fn(delta), .groups = "drop")
+
+# Per species
+species_effect <- eff_draws %>%
+  pivot_wider(id_cols = c(.draw, .category, Name),
+              names_from = cover_level, values_from = .epred) %>%
+  mutate(delta = high - low) %>%
+  group_by(Name, .category) %>%
+  summarise(median_pp = median(delta) * 100,
+            lower = quantile(delta, .025) * 100,
+            upper = quantile(delta, .975) * 100,
+            pd    = pd_fn(delta), .groups = "drop")
+
+save_effect_docx(community_effect, "Effect_Community_Status.docx",
+  "Community-level change in behavior probability across the cover gradient (Obj. 2a)")
+save_effect_docx(species_effect,   "Effect_Species_Status.docx",
+  "Species-specific change in behavior probability across the cover gradient (Obj. 2a)")
+```
+
+```{r effect_tables_location}
+cover_lo_i <- min(dat_inv$Avg_Cogongrass_Cover, na.rm = TRUE)
+cover_hi_i <- max(dat_inv$Avg_Cogongrass_Cover, na.rm = TRUE)
+
+newdata_loc_eff <- expand_grid(
+  BehLoc      = c("Non_Patch", "Patch"),
+  cover_level = c("low", "high"),
+  Name        = unique(dat_inv$Name)
+) %>%
+  mutate(Avg_Cogongrass_Cover = ifelse(cover_level == "low", cover_lo_i, cover_hi_i),
+         Site = NA, Camera.Type = NA, Month = NA)
+
+loc_eff_draws <- add_epred_draws(newdata_loc_eff, model_loc, re_formula = NA) %>%
+  ungroup()
+
+# --- Community (averaged over species) ---
+loc_draws <- loc_eff_draws %>%
+  group_by(.draw, .category, BehLoc, cover_level) %>%
+  summarise(.epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = cover_level, values_from = .epred) %>%
+  mutate(cover_effect = high - low)
+
+# cover effect within each location
+loc_effect <- loc_draws %>%
+  group_by(.category, BehLoc) %>%
+  summarise(median_pp = median(cover_effect) * 100,
+            lower = quantile(cover_effect, .025) * 100,
+            upper = quantile(cover_effect, .975) * 100,
+            pd    = pd_fn(cover_effect), .groups = "drop")
+
+# Patch - Non_Patch
+loc_diff <- loc_draws %>%
+  dplyr::select(.draw, .category, BehLoc, cover_effect) %>%
+  pivot_wider(names_from = BehLoc, values_from = cover_effect) %>%
+  mutate(diff = Patch - Non_Patch) %>%
+  group_by(.category) %>%
+  summarise(median_pp = median(diff) * 100,
+            lower = quantile(diff, .025) * 100,
+            upper = quantile(diff, .975) * 100,
+            pd    = pd_fn(diff), .groups = "drop")
+
+# --- Per species ---
+loc_draws_sp <- loc_eff_draws %>%
+  pivot_wider(id_cols = c(.draw, .category, Name, BehLoc),
+              names_from = cover_level, values_from = .epred) %>%
+  mutate(cover_effect = high - low)
+
+loc_effect_sp <- loc_draws_sp %>%
+  group_by(Name, .category, BehLoc) %>%
+  summarise(median_pp = median(cover_effect) * 100,
+            lower = quantile(cover_effect, .025) * 100,
+            upper = quantile(cover_effect, .975) * 100,
+            pd    = pd_fn(cover_effect), .groups = "drop")
+
+loc_diff_sp <- loc_draws_sp %>%
+  dplyr::select(.draw, .category, Name, BehLoc, cover_effect) %>%
+  pivot_wider(names_from = BehLoc, values_from = cover_effect) %>%
+  mutate(diff = Patch - Non_Patch) %>%
+  group_by(Name, .category) %>%
+  summarise(median_pp = median(diff) * 100,
+            lower = quantile(diff, .025) * 100,
+            upper = quantile(diff, .975) * 100,
+            pd    = pd_fn(diff), .groups = "drop")
+
+
+# --- Community-level Patch -------------------
+loc_level_draws <- loc_eff_draws %>%
+  group_by(.draw, .category, BehLoc) %>%
+  summarise(.epred = mean(.epred), .groups = "drop") %>%
+  pivot_wider(names_from = BehLoc, values_from = .epred) %>%
+  mutate(level_diff = Patch - Non_Patch)
+
+loc_level <- loc_level_draws %>%
+  group_by(.category) %>%
+  summarise(median_pp = median(level_diff) * 100,
+            lower = quantile(level_diff, .025) * 100,
+            upper = quantile(level_diff, .975) * 100,
+            pd    = pd_fn(level_diff), .groups = "drop")
+
+# --- Species-specific version --------------------------------------------
+loc_level_sp_draws <- loc_eff_draws %>%
+  group_by(.draw, .category, Name, BehLoc) %>%
+  summarise(.epred = mean(.epred), .groups = "drop") %>%   # avg over cover_level
+  pivot_wider(names_from = BehLoc, values_from = .epred) %>%
+  mutate(level_diff = Patch - Non_Patch)
+
+loc_level_sp <- loc_level_sp_draws %>%
+  group_by(Name, .category) %>%
+  summarise(median_pp = median(level_diff) * 100,
+            lower = quantile(level_diff, .025) * 100,
+            upper = quantile(level_diff, .975) * 100,
+            pd    = pd_fn(level_diff), .groups = "drop")
+
+save_effect_docx(loc_effect,    "Effect_Location_byLocation.docx",
+  "Cover effect on behavior within each location (Obj. 2b)")
+save_effect_docx(loc_diff,      "Effect_Location_PatchDiff.docx",
+  "Patch minus Non-Patch difference in the cover effect (Obj. 2b headline)")
+save_effect_docx(loc_effect_sp, "Effect_Location_Species_byLocation.docx",
+  "Species-specific cover effect within each location (Obj. 2b)")
+save_effect_docx(loc_diff_sp,   "Effect_Location_Species_PatchDiff.docx",
+  "Species-specific Patch minus Non-Patch difference in the cover effect (Obj. 2b)")
+
+save_effect_docx(loc_level,    "Effect_Location_LevelDiff.docx",
+  "Patch minus Non-Patch difference in behavior probability (Obj. 2b, level contrast)")
+save_effect_docx(loc_level_sp, "Effect_Location_Species_LevelDiff.docx",
+  "Species-specific Patch minus Non-Patch difference in behavior probability (Obj. 2b)")
+```
+
+
+# 5. Figures
+
+```{r cover_gradient_community}
+cover_seq <- seq(cover_lo, cover_hi, length.out = 100)
+
+behavior_summary <- add_epred_draws(
+    expand_grid(Avg_Cogongrass_Cover = cover_seq, Name = unique(dat$Name)) %>%
+      mutate(Site = NA, Camera.Type = NA, Month = NA),
+    model_status, re_formula = NA, ndraws = 2000) %>%
+  ungroup() %>%
+  group_by(Avg_Cogongrass_Cover, .draw, .category) %>%
+  summarise(.epred = mean(.epred), .groups = "drop") %>%
+  group_by(Avg_Cogongrass_Cover, .category) %>%
+  median_qi(.epred, .width = 0.95) %>%
+  mutate(Behavior = factor(.category,
+           levels = c("Local_Search", "Foraging", "Transit"),
+           labels = c("Local Search", "Foraging", "Transit")))
+
+plot_proportions <- dat %>%
+  group_by(Plot) %>%
+  mutate(plot_cover = mean(Avg_Cogongrass_Cover, na.rm = TRUE)) %>%
+  group_by(Plot, plot_cover, Behavior) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Plot, plot_cover) %>%
+  mutate(site_prob = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(Behavior = factor(Behavior,
+           levels = c("Local_Search", "Foraging", "Transit"),
+           labels = c("Local Search", "Foraging", "Transit")))
+
+p_community <- ggplot(behavior_summary,
+       aes(Avg_Cogongrass_Cover, .epred, color = Behavior, fill = Behavior)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(data = plot_proportions, inherit.aes = FALSE,
+             aes(plot_cover, site_prob, fill = Behavior),
+             shape = 21, color = "black", alpha = 0.3, size = 2.2, stroke = 0.6) +
+  scale_color_manual(values = behavior_colors, name = "Behavior") +
+  scale_fill_manual(values = behavior_colors, name = "Behavior") +
+  scale_y_continuous(limits = c(0, 1), labels = label_percent(accuracy = 1)) +
+  labs(x = "Cogongrass Cover (%)", y = "Predicted Probability") +
+  theme_classic(base_size = 12) + theme(axis.title = element_text(face = "bold"))
+
+print(p_community)
+ggsave("Figure_Behavior_by_Cover.png", p_community,
+       width = 7, height = 5, dpi = 600, bg = "white")
+```
+
+```{r cover_gradient_species}
+behavior_summary_sp <- add_epred_draws(
+    expand_grid(Avg_Cogongrass_Cover = cover_seq, Name = unique(dat$Name)) %>%
+      mutate(Site = NA, Camera.Type = NA, Month = NA),
+    model_status, re_formula = NA, ndraws = 2000) %>%
+  ungroup() %>%
+  group_by(Name, Avg_Cogongrass_Cover, .category) %>%
+  median_qi(.epred, .width = 0.95) %>%
+  mutate(Behavior = factor(.category,
+           levels = c("Local_Search", "Foraging", "Transit"),
+           labels = c("Local Search", "Foraging", "Transit")),
+         Name = factor(recode(Name, !!!common_names), levels = common_names))
+
+p_species <- ggplot(behavior_summary_sp,
+       aes(Avg_Cogongrass_Cover, .epred, color = Behavior, fill = Behavior)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ Name) +
+  scale_color_manual(values = behavior_colors, name = "Behavior") +
+  scale_fill_manual(values = behavior_colors, name = "Behavior") +
+  scale_y_continuous(limits = c(0, 1), labels = label_percent()) +
+  labs(x = "Cogongrass Cover (%)", y = "Behavior Probability") +
+  theme_classic()
+
+print(p_species)
+ggsave("Figure_Behavior_by_Species.png", p_species,
+       width = 8, height = 7, dpi = 600, bg = "white")
+```
+
+```{r cover_gradient_location}
+cover_seq_inv <- seq(cover_lo_i, cover_hi_i, length.out = 100)
+
+behavior_summary_loc <- add_epred_draws(
+    expand_grid(BehLoc = c("Non_Patch", "Patch"),
+                Avg_Cogongrass_Cover = cover_seq_inv,
+                Name = unique(dat_inv$Name)) %>%
+      mutate(Site = NA, Camera.Type = NA, Month = NA),
+    model_loc, re_formula = NA, ndraws = 2000) %>%
+  ungroup() %>%
+  group_by(BehLoc, Avg_Cogongrass_Cover, .draw, .category) %>%
+  summarise(.epred = mean(.epred), .groups = "drop") %>%
+  group_by(BehLoc, Avg_Cogongrass_Cover, .category) %>%
+  median_qi(.epred, .width = 0.95) %>%
+  mutate(Behavior = factor(.category,
+           levels = c("Local_Search", "Foraging", "Transit"),
+           labels = c("Local Search", "Foraging", "Transit")),
+         BehLoc = factor(BehLoc, levels = c("Non_Patch", "Patch"),
+                         labels = c("Non-Patch", "Patch")))
+
+plot_proportions_loc <- dat_inv %>%
+  group_by(Plot) %>%
+  mutate(plot_cover = mean(Avg_Cogongrass_Cover, na.rm = TRUE)) %>%
+  group_by(Plot, plot_cover, BehLoc, Behavior) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(Plot, plot_cover, BehLoc) %>%
+  mutate(site_prob = n / sum(n)) %>%
+  ungroup() %>%
+  mutate(BehLoc = factor(BehLoc, levels = c("Non_Patch", "Patch"),
+                         labels = c("Non-Patch", "Patch")),
+         Behavior = factor(Behavior,
+           levels = c("Local_Search", "Foraging", "Transit"),
+           labels = c("Local Search", "Foraging", "Transit")))
+
+p_loc <- ggplot(behavior_summary_loc,
+       aes(Avg_Cogongrass_Cover, .epred, color = BehLoc, fill = BehLoc)) +
+  geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2, color = NA) +
+  geom_line(linewidth = 0.9) +
+  geom_point(data = plot_proportions_loc, inherit.aes = FALSE,
+             aes(plot_cover, site_prob, fill = BehLoc),
+             shape = 21, color = "black", alpha = 0.3, size = 2.2, stroke = 0.6) +
+  facet_wrap(~ Behavior) +
+  scale_color_manual(values = location_colors, name = "Location") +
+  scale_fill_manual(values = location_colors, name = "Location") +
+  scale_y_continuous(limits = c(0, 1), labels = label_percent(accuracy = 1)) +
+  labs(x = "Cogongrass Cover (%)", y = "Predicted Probability") +
+  theme_classic(base_size = 12) + theme(axis.title = element_text(face = "bold"))
+
+print(p_loc)
+ggsave("Figure_Behavior_by_Location.png", p_loc,
+       width = 8, height = 4, dpi = 600, bg = "white")
+```
+
+```{r cover_gradient_location_species}
+behavior_summary_loc_sp <- add_epred_draws(
+    expand_grid(BehLoc = c("Non_Patch", "Patch"),
+                Avg_Cogongrass_Cover = cover_seq_inv,
+                Name = unique(dat_inv$Name)) %>%
+      mutate(Site = NA, Camera.Type = NA, Month = NA),
+    model_loc, re_formula = NA, ndraws = 2000) %>%
+  ungroup() %>%
+  group_by(Name, BehLoc, Avg_Cogongrass_Cover, .category) %>%
+  median_qi(.epred, .width = 0.95) %>%
+  mutate(Behavior = factor(.category,
+           levels = c("Local_Search", "Foraging", "Transit"),
+           labels = c("Search", "Foraging", "Transit")),
+         BehLoc = factor(BehLoc, levels = c("Non_Patch", "Patch"),
+                         labels = c("Non-Patch", "Patch")),
+         Name = factor(recode(Name, !!!common_names), levels = common_names))
+
+make_loc_species_plot <- function(df) {
+  ggplot(df, aes(Avg_Cogongrass_Cover, .epred, color = BehLoc, fill = BehLoc)) +
+    geom_ribbon(aes(ymin = .lower, ymax = .upper), alpha = 0.2, color = NA) +
+    geom_line(linewidth = 0.7) +
+    facet_grid(Name ~ Behavior) +
+    scale_color_manual(values = location_colors, name = "Location") +
+    scale_fill_manual(values = location_colors, name = "Location") +
+    scale_y_continuous(limits = c(0, 1), labels = label_percent()) +
+    labs(x = "Cogongrass Cover (%)", y = "Behavior Probability") +
+    theme_classic(base_size = 11)
+}
+
+species_levels <- levels(behavior_summary_loc_sp$Name)
+p_loc_sp_1 <- make_loc_species_plot(behavior_summary_loc_sp %>%
+                filter(Name %in% species_levels[1:5]))
+p_loc_sp_2 <- make_loc_species_plot(behavior_summary_loc_sp %>%
+                filter(Name %in% species_levels[6:length(species_levels)]))
+
+print(p_loc_sp_1); print(p_loc_sp_2)
+ggsave("Figure_Behavior_by_Species_Within_1.png", p_loc_sp_1,
+       width = 9, height = 8, dpi = 600, bg = "white")
+ggsave("Figure_Behavior_by_Species_Within_2.png", p_loc_sp_2,
+       width = 9, height = 7, dpi = 600, bg = "white")
+```
+
+## Patch vs. Non-Patch Differences
+```{r patch_nonpatch_diff}
+library(forcats)
+
+loc_level_draws <- loc_level_draws %>%
+  mutate(Behavior = factor(.category,
+           levels = c("Local_Search","Foraging","Transit"),
+           labels = c("Local Search","Foraging","Transit")),
+         level_diff_pp = level_diff * 100)
+
+loc_level <- loc_level %>%
+  mutate(Behavior = factor(.category,
+           levels = c("Local_Search","Foraging","Transit"),
+           labels = c("Local Search","Foraging","Transit")))
+
+p_level <- ggplot(loc_level_draws,
+       aes(x = level_diff_pp, y = fct_rev(Behavior), fill = Behavior)) +
+  geom_vline(xintercept = 0, linetype = 2, color = "grey40") +
+  stat_halfeye(.width = 0.95, point_interval = "median_qi",
+               slab_alpha = 0.75, normalize = "xy") +
+  geom_text(data = loc_level,
+            aes(x = upper, y = fct_rev(Behavior),
+                label = sprintf("pd = %.2f", pd)),
+            inherit.aes = FALSE, hjust = -0.15, size = 3.3) +
+  scale_fill_manual(values = behavior_colors, guide = "none") +
+  scale_x_continuous(expand = expansion(mult = c(0.05, 0.18))) +
+  labs(x = "Patch − Non-Patch Difference in Predicted Probability",
+       y = NULL) +
+  theme_classic(base_size = 12) +
+  theme(axis.title = element_text(face = "bold"))
+
+print(p_level)
+ggsave("Figure_Patch_Level_Contrast.png", p_level,
+       width = 7, height = 4.5, dpi = 600, bg = "white")
+```
+
+```{r combined_figure, eval=FALSE}
+combined_plot <- (p_community / p_loc) + plot_annotation(tag_levels = "A")
+ggsave("Figure_Behavior_Combined.png", combined_plot,
+       width = 8, height = 10, dpi = 600, bg = "white")
+```
